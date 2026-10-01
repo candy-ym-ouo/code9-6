@@ -1,37 +1,50 @@
 import { Router } from 'express';
-import { z } from 'zod';
 import {
   addDaysToKey,
   distanceBand,
   distanceKm,
   formatLocal,
   localDateKey,
-  resolveAnchor,
   sunEvents,
-  theoreticalOkForDay,
   theoreticalDaysInYear,
+  theoreticalOkForDay,
   timingSchema,
+  validateTiming,
   type TimingDto,
+  type TimingIssue,
 } from '@flil/shared';
 import { getDb, newId, nowIso, toJson } from '../db.js';
 import { ah, ok } from '../http/respond.js';
 import { authenticate } from '../http/middleware.js';
-import { ctxOf, libraryTz } from '../http/context.js';
+import { ctxOf } from '../http/context.js';
 import { errors } from '../http/errors.js';
-import { requireInspiration, syncStatus, touch } from '../services/inspirations.js';
+import { requireInspiration, syncStatus } from '../services/inspirations.js';
 import {
   computeWindowsForInspiration,
   listWindows,
   loadSpotGeom,
   loadTiming,
+  previewAstronomy,
   timingRowToDto,
   windowSummary,
 } from '../services/windowEngine.js';
 import { climateAt, climateStats, getForecast } from '../services/weather.js';
-import { toInspirationDto } from '../services/serialization.js';
 
 export const timingRouter = Router();
 timingRouter.use(authenticate());
+
+/** 形状校验通过后做跨字段语义校验，任何无效条件都以可逐条展示的理由拒绝（400） */
+function parseTimingBody(body: unknown): TimingDto {
+  const timing = timingSchema.parse(body) as TimingDto;
+  const issues: TimingIssue[] = validateTiming(timing);
+  if (issues.length > 0) {
+    throw errors.badRequest(
+      issues.map((i: TimingIssue) => i.message).join('；'),
+      { issues },
+    );
+  }
+  return timing;
+}
 
 function upsertTiming(libraryId: string, inspirationId: string, input: TimingDto): void {
   const db = getDb();
@@ -42,7 +55,9 @@ function upsertTiming(libraryId: string, inspirationId: string, input: TimingDto
     input.anchorOffsetMin,
     toJson(input.elevationRange),
     input.azimuthRange ? toJson(input.azimuthRange) : null,
+    toJson(input.azimuthArcs),
     input.azimuthTolerance,
+    toJson(input.allowedIntervals),
     input.windowToleranceMin,
     toJson(input.weatherProfile),
     input.seasonWindow ? toJson(input.seasonWindow) : null,
@@ -51,15 +66,15 @@ function upsertTiming(libraryId: string, inspirationId: string, input: TimingDto
   if (existing) {
     db.prepare(
       `UPDATE timing SET time_anchor = ?, anchor_offset_min = ?, elevation_range = ?, azimuth_range = ?,
-         azimuth_tolerance = ?, window_tolerance_min = ?, weather_profile = ?, season_window = ?, notes = ?,
-         updated_at = ? WHERE id = ?`,
+         azimuth_arcs = ?, azimuth_tolerance = ?, allowed_intervals = ?, window_tolerance_min = ?,
+         weather_profile = ?, season_window = ?, notes = ?, updated_at = ? WHERE id = ?`,
     ).run(...(values as never[]), ts, existing.id);
   } else {
     db.prepare(
       `INSERT INTO timing (id, library_id, inspiration_id, time_anchor, anchor_offset_min, elevation_range,
-         azimuth_range, azimuth_tolerance, window_tolerance_min, weather_profile, season_window, notes,
-         created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         azimuth_range, azimuth_arcs, azimuth_tolerance, allowed_intervals, window_tolerance_min,
+         weather_profile, season_window, notes, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(newId(), libraryId, inspirationId, ...(values as never[]), ts, ts);
   }
 }
@@ -79,7 +94,7 @@ timingRouter.put(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     const row = requireInspiration(req.params.id, ctx.libraryId);
-    const input = timingSchema.parse(req.body) as TimingDto;
+    const input = parseTimingBody(req.body);
     upsertTiming(ctx.libraryId, row.id, input);
     syncStatus(row.id);
 
@@ -91,29 +106,36 @@ timingRouter.put(
   }),
 );
 
-/** 锚点解析预览：告诉用户"你说的这个锚点，今天对应几点、仰角多少" */
+/**
+ * 锚点解析预览：告诉用户"你说的这个锚点，今天对应几点、每段允许区间能不能成立"。
+ * 与窗口判定、可满足率共用 evaluateAstronomy——同一份条件，三处结论必须一致。
+ */
 timingRouter.post(
   '/inspirations/:id/timing/preview',
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     const row = requireInspiration(req.params.id, ctx.libraryId);
-    const input = timingSchema.parse(req.body) as TimingDto;
+    const input = parseTimingBody(req.body);
     if (!row.spot_id) throw errors.badRequest('该卡片还没有机位，先把机位定下来');
     const spot = loadSpotGeom(row.spot_id);
     if (!spot) throw errors.badRequest('机位不存在');
 
     const today = localDateKey(new Date(), spot.tz);
+    const astro = previewAstronomy(spot, input, today);
     const events = sunEvents(spot.lat, spot.lng, spot.tz, today);
-    const resolved = resolveAnchor(events, input);
+    const anchorReason = astro.reasons.find((r) => r.code === 'ANCHOR_RESOLVED');
+    // 仅锚点本身不可解析（极昼/极夜/偏移越界）才没有锚点时刻；季节外仍展示"锚点长什么样"
+    const anchorAt = astro.reasons.some((r) => r.code === 'ANCHOR_UNRESOLVABLE') ? null : astro.anchorAt;
 
     const sat = await satisfactionRate(spot.lat, spot.lng, spot.tz, input, 30);
     ok(res, {
       date: today,
-      anchorAt: resolved ? resolved.anchorAt.toISOString() : null,
-      anchorLocal: resolved ? formatLocal(resolved.anchorAt, spot.tz) : null,
-      elevationRange: resolved?.elevationRange ?? input.elevationRange,
-      polarity: events.polar,
-      notes: [...events.notes, ...(resolved?.notes ?? [])],
+      anchorAt: anchorAt ? anchorAt.toISOString() : null,
+      anchorLocal: anchorAt ? formatLocal(anchorAt, spot.tz) : null,
+      verdict: astro.verdict,
+      reasons: astro.reasons,
+      polarity: astro.polar,
+      notes: astro.reasons.filter((r) => r.level === 'info').map((r) => r.text),
       sunEvents: {
         sunrise: events.sunrise ? formatLocal(events.sunrise, spot.tz) : null,
         sunset: events.sunset ? formatLocal(events.sunset, spot.tz) : null,
@@ -128,6 +150,17 @@ timingRouter.post(
           ? `${formatLocal(events.bluePm.start, spot.tz)}–${formatLocal(events.bluePm.end, spot.tz)}`
           : null,
       },
+      // 多段允许区间逐段预览：含跨午夜，按机位本地钟点给出可复算窗口
+      segments: astro.segments.map((s) => ({
+        label: s.label,
+        startLocal: formatLocal(s.startAt, spot.tz, true),
+        endLocal: formatLocal(s.endAt, spot.tz, true),
+        windowLocal: s.run ? `${formatLocal(s.run.start, spot.tz, true)}–${formatLocal(s.run.end, spot.tz, true)}` : null,
+        verdict: s.rejected ? 'bad' : s.durationMin < 5 ? 'marginal' : 'good',
+        durationMin: Number(s.durationMin.toFixed(1)),
+        reasons: s.reasons,
+      })),
+      anchorNote: anchorReason?.text ?? null,
       satisfiability: sat,
     });
   }),

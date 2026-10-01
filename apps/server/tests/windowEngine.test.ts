@@ -12,8 +12,10 @@ function timing(patch: Partial<TimingDto> = {}): TimingDto {
     anchorOffsetMin: 40,
     elevationRange: [-4, 10],
     azimuthRange: null,
+    azimuthArcs: [],
     azimuthTolerance: 15,
     windowToleranceMin: 12,
+    allowedIntervals: [],
     weatherProfile: {},
     seasonWindow: null,
     notes: null,
@@ -169,5 +171,75 @@ describe('窗口判定：天气项（硬性 vs 软性）', () => {
     );
     const precip = r.reasons.find((x) => x.code.startsWith('PRECIP'));
     expect(precip?.text).toMatch(/9[05]%/);
+  });
+});
+
+describe('多段允许区间 / 方位弧：窗口判定与天文评估一致', () => {
+  it('允许区间覆盖锚点窗口时，与不设区间结论一致', () => {
+    // 上海 10-11 日落前 40 分约 16:47，容差 ±12 分 → 16:35–16:59
+    const base = timing();
+    const a = computeDay(SPOT, base, DATE, forecast());
+    const withIv = timing({ allowedIntervals: [{ startMin: 16 * 60 + 30, endMin: 17 * 60 + 10 }] });
+    const b = computeDay(SPOT, withIv, DATE, forecast());
+    expect(b.verdict).toBe(a.verdict);
+    expect(b.startAt.getTime()).toBeGreaterThanOrEqual(a.startAt.getTime() - 60000);
+  });
+
+  it('只允许深夜区间（跨午夜）时，日落锚点整天不成立', () => {
+    const r = computeDay(
+      SPOT,
+      timing({ allowedIntervals: [{ startMin: 22 * 60, endMin: 2 * 60 }] }),
+      DATE,
+      forecast(),
+    );
+    expect(r.verdict).toBe('bad');
+    expect(r.reasons.some((x) => x.code === 'ELEVATION_MISS' || x.code === 'AZIMUTH_MISS')).toBe(true);
+  });
+
+  it('两段区间中任一段成立即可，理由逐段可复算（含跨午夜跳过说明）', () => {
+    const r = computeDay(
+      SPOT,
+      timing({
+        elevationRange: [-90, 90],
+        allowedIntervals: [
+          { startMin: 23 * 60, endMin: 23 * 60 + 30 }, // 深夜：太阳在北侧低位
+          { startMin: 16 * 60 + 35, endMin: 17 * 60 + 5 }, // 覆盖真实窗口
+        ],
+      }),
+      DATE,
+      forecast(),
+    );
+    expect(['good', 'marginal']).toContain(r.verdict);
+    const text = r.reasons.map((x) => x.text).join(' | ');
+    expect(text).toMatch(/区间 2/);
+  });
+
+  it('多段方位弧（跨正北）按环形判定：南侧弧拒绝、跨正北弧按真实方位命中', () => {
+    // 日落前 40 分上海太阳方位约 250°+，南侧小弧必不命中
+    const south = computeDay(
+      SPOT,
+      timing({ azimuthRange: null, azimuthArcs: [{ startDeg: 170, endDeg: 190 }] }),
+      DATE,
+      forecast(),
+    );
+    expect(south.verdict).toBe('bad');
+    expect(south.reasons.some((x) => x.code === 'AZIMUTH_MISS')).toBe(true);
+
+    // 用一段包围 250°–270° 的弧（不跨正北）应当命中
+    const hit = computeDay(
+      SPOT,
+      timing({ azimuthRange: null, azimuthArcs: [{ startDeg: 240, endDeg: 280 }] }),
+      DATE,
+      forecast(),
+    );
+    expect(hit.verdict).toBe('good');
+    expect(hit.reasons.some((x) => x.code === 'AZIMUTH_OK')).toBe(true);
+  });
+
+  it('极区极夜：窗口判定 bad 且理由与可满足率口径一致', () => {
+    const polarSpot = { ...SPOT, lat: 78.22, lng: 15.65, tz: 'Europe/Oslo' };
+    const r = computeDay(polarSpot, timing({ timeAnchor: 'sunset_minus' }), '2026-12-21', []);
+    expect(r.verdict).toBe('bad');
+    expect(r.reasons.some((x) => x.code === 'ANCHOR_UNRESOLVABLE')).toBe(true);
   });
 });

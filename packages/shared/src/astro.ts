@@ -5,8 +5,16 @@
  * 以及窗口内的逐点采样。所有角度单位为「度」，方位角以正北为 0、顺时针增加。
  */
 
-import { addMinutes, localDayRangeUtc, parseLocalDateKey, zonedTimeToUtc, utcToZonedParts } from './time.js';
-import type { TimingDto } from './types.js';
+import {
+  addMinutes,
+  formatLocal,
+  localDayRangeUtc,
+  parseLocalDateKey,
+  zonedTimeToUtc,
+  utcToZonedParts,
+} from './time.js';
+import type { WindowVerdict } from './enums.js';
+import type { AzimuthArc, ClockInterval, TimingDto, WindowReasonDto } from './types.js';
 
 const DEG = Math.PI / 180;
 const RAD = 180 / Math.PI;
@@ -395,16 +403,7 @@ export function theoreticalDaysInYear(
   lat: number,
   lng: number,
   tz: string,
-  timing: Pick<
-    TimingDto,
-    | 'timeAnchor'
-    | 'anchorOffsetMin'
-    | 'elevationRange'
-    | 'azimuthRange'
-    | 'azimuthTolerance'
-    | 'seasonWindow'
-    | 'windowToleranceMin'
-  >,
+  timing: TimingDto,
   year: number,
 ): { date: string; ok: boolean }[] {
   const out: { date: string; ok: boolean }[] = [];
@@ -425,35 +424,9 @@ export function theoreticalOkForDay(
   lng: number,
   tz: string,
   date: string,
-  timing: Pick<
-    TimingDto,
-    | 'timeAnchor'
-    | 'anchorOffsetMin'
-    | 'elevationRange'
-    | 'azimuthRange'
-    | 'azimuthTolerance'
-    | 'seasonWindow'
-    | 'windowToleranceMin'
-  >,
+  timing: TimingDto,
 ): boolean {
-  if (timing.seasonWindow) {
-    const { month } = parseLocalDateKey(date);
-    const { fromMonth, toMonth } = timing.seasonWindow;
-    const inSeason =
-      fromMonth <= toMonth ? month >= fromMonth && month <= toMonth : month >= fromMonth || month <= toMonth;
-    if (!inSeason) return false;
-  }
-  const events = sunEvents(lat, lng, tz, date);
-  const resolved = resolveAnchor(events, timing);
-  if (!resolved) return false;
-  const [start, end] = bandToRange(resolved, timing);
-  const samples = sampleWindow(lat, lng, start, end, 5);
-  const usable = samples.filter((s) => elevationInRange(s.elevationDeg, timing.elevationRange));
-  if (usable.length < 2) return false;
-  if (!timing.azimuthRange) return true;
-  const [azLo, azHi] = timing.azimuthRange;
-  const center = (azLo + azHi) / 2;
-  return usable.some((s) => angularDistance(s.azimuthDeg, center) <= timing.azimuthTolerance + 0.001);
+  return evaluateAstronomy(lat, lng, tz, date, timing).verdict !== 'bad';
 }
 
 export function elevationInRange(elevationDeg: number, range: number[]): boolean {
@@ -466,6 +439,60 @@ export function angularDistance(a: number, b: number): number {
   return d > 180 ? 360 - d : d;
 }
 
+/** 归一化到 [0, 360)（360 本身视作 0） */
+export function normalizeAzimuth(deg: number): number {
+  return ((deg % 360) + 360) % 360;
+}
+
+/**
+ * 判断方位角是否落在「从 startDeg 顺时针走到 endDeg」的圆弧内（边界含）。
+ * endDeg <= startDeg 表示跨过 0°/360°（例：350→10）；endDeg 允许为 360（上界，等价 0°）。
+ * 零宽弧（起终点等价）不含任何方向——无效输入在 validateTiming 处已拒绝。
+ */
+export function azimuthArcContains(valueDeg: number, arc: AzimuthArc): boolean {
+  const { startDeg, endDeg } = arc;
+  // 整圈（中心±180 会生成这种弧；直接输入 [0,360] 在 validateTiming 处被拒绝）
+  if (startDeg === 0 && endDeg === 360) return true;
+  const start = startDeg; // 0..360
+  const end = endDeg === 360 ? 0 : endDeg; // 结束于 360 ≡ 正北 0°，但仍与开始在同一弧内
+  const v = normalizeAzimuth(valueDeg);
+  if (start === end) return false; // 零宽弧不含任何方向
+  if (start < end) return v >= start && v <= end;
+  // 跨正北：[start, 360) ∪ [0, end]；end=360 归一为 0，正北仍由 v<=0 包含
+  return v >= start || v <= end;
+}
+
+const ARC_EDGE_EPS = 0.001;
+
+/**
+ * 把全部方位角约束展开成一组顺时针圆弧：
+ * - 旧字段 azimuthRange（方位角中心 ± 容差）→ 以中心为中点的圆弧；
+ * - 新字段 azimuthArcs → 原样使用，端点各外扩 0.001° 抵消采样误差（外扩时保持环绕方向，
+ *   不能把 [0,90] 这种贴边普通弧错误翻成跨正北弧）。
+ */
+export function effectiveAzimuthArcs(timing: TimingDto): AzimuthArc[] {
+  if (timing.azimuthRange) {
+    const [azLo, azHi] = timing.azimuthRange;
+    const center = (azLo + azHi) / 2;
+    const tol = Math.min(180, timing.azimuthTolerance);
+    if (tol >= 180) return [{ startDeg: 0, endDeg: 360 }];
+    return [{ startDeg: normalizeAzimuth(center - tol), endDeg: normalizeAzimuth(center + tol) }];
+  }
+  return timing.azimuthArcs.map((a) => {
+    const wraps = a.endDeg <= a.startDeg;
+    if (wraps) {
+      return {
+        startDeg: (a.startDeg - ARC_EDGE_EPS + 360) % 360,
+        endDeg: (a.endDeg + ARC_EDGE_EPS) % 360,
+      };
+    }
+    return {
+      startDeg: Math.max(0, a.startDeg - ARC_EDGE_EPS),
+      endDeg: Math.min(360, a.endDeg + ARC_EDGE_EPS),
+    };
+  });
+}
+
 /** 把锚点解析结果变成用于判定的 [start, end] 区间 */
 export function bandToRange(
   resolved: AnchorResolution,
@@ -474,4 +501,404 @@ export function bandToRange(
   if (resolved.band) return [resolved.band.start, resolved.band.end];
   const tol = Math.max(1, timing.windowToleranceMin ?? 12);
   return [addMinutes(resolved.anchorAt, -tol), addMinutes(resolved.anchorAt, tol)];
+}
+
+// ---------------------------------------------------------------------------
+// 多段允许区间（机位本地钟点，可跨午夜）+ 统一天文评估器
+// ---------------------------------------------------------------------------
+
+/**
+ * 把一段机位时区本地钟点区间落到某一本地日期对应的 UTC 绝对区间。
+ * endMin <= startMin → 结束在次日（跨午夜）；endMin = 1440 = 次日 00:00。
+ */
+export function clockIntervalToUtc(dateKey: string, tz: string, iv: ClockInterval): { start: Date; end: Date } {
+  const { year, month, day } = parseLocalDateKey(dateKey);
+  const startH = Math.floor(iv.startMin / 60);
+  const startM = iv.startMin % 60;
+  const spansMidnight = iv.endMin <= iv.startMin;
+  const endDay = day + (spansMidnight ? 1 : 0);
+  const endH = Math.floor(iv.endMin / 60) % 24;
+  const endM = iv.endMin % 60;
+  return {
+    start: zonedTimeToUtc(tz, year, month, day, startH, startM),
+    end: zonedTimeToUtc(tz, year, month, endDay, endH, endM),
+  };
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+function fmtDeg(v: number | null | undefined, digits = 1): string {
+  return v === null || v === undefined ? '未知' : `${v.toFixed(digits)}°`;
+}
+
+/** 23:00–01:00 这种跨午夜区间的可复算标签 */
+export function formatClockInterval(iv: ClockInterval): string {
+  const hm = (m: number) => `${pad2(Math.floor(m / 60) % 24)}:${pad2(m % 60)}`;
+  const wrap = iv.endMin <= iv.startMin;
+  return `${hm(iv.startMin)}–${hm(iv.endMin)}${wrap ? '（次日）' : ''}`;
+}
+
+export interface AstronomySegment {
+  label: string;
+  startAt: Date;
+  endAt: Date;
+  /** 该段选出的最佳连续窗口 */
+  run: { start: Date; end: Date } | null;
+  /** 该段贡献的判定理由（bad 段也带自己的原因，便于逐段复算） */
+  reasons: WindowReasonDto[];
+  /** true = 该段天文条件不成立（不会参与窗口选择） */
+  rejected: boolean;
+  /** 被拒原因的级别汇总，用于可满足率统计 */
+  failureCode: string | null;
+  /** 窗口中点的太阳位置 */
+  midPosition: SolarPosition | null;
+  durationMin: number;
+  /** 命中采样点的实际仰角/方位范围 */
+  observed: { elevMin: number; elevMax: number; azMin: number; azMax: number } | null;
+}
+
+export interface AstronomyEvaluation {
+  date: string;
+  anchorAt: Date;
+  polar: SunEvents['polar'];
+  verdict: WindowVerdict;
+  reasons: WindowReasonDto[];
+  segments: AstronomySegment[];
+  /** 多段中时长最长的可用段；全部不成立时为 null */
+  bestSegment: AstronomySegment | null;
+  sunElevation: number | null;
+  sunAzimuth: number | null;
+  outOfSeason: boolean;
+}
+
+/** 采样点间隔至少 1 分钟、单段最多 300 点 */
+function sampleStepMin(start: Date, end: Date): number {
+  const spanMin = Math.max(1, (end.getTime() - start.getTime()) / 60000);
+  return Math.max(1, Math.ceil(spanMin / 300));
+}
+
+/** 找连续（间断 ≤ 6 分钟）满足采样点中最长的一段 */
+export function longestContiguousRun(
+  samples: { at: Date; ok: boolean }[],
+  gapMin = 6,
+): { start: Date; end: Date } | null {
+  let best: { start: Date; end: Date } | null = null;
+  let runStart: Date | null = null;
+  let prevAt: Date | null = null;
+
+  const consider = (start: Date, end: Date) => {
+    if (!best || end.getTime() - start.getTime() > best.end.getTime() - best.start.getTime()) {
+      best = { start, end };
+    }
+  };
+
+  for (const s of samples) {
+    if (s.ok) {
+      if (!runStart) {
+        runStart = s.at;
+      } else if (prevAt && (s.at.getTime() - prevAt.getTime()) / 60000 > gapMin) {
+        consider(runStart, prevAt);
+        runStart = s.at;
+      }
+      prevAt = s.at;
+    } else if (runStart && prevAt) {
+      consider(runStart, prevAt);
+      runStart = null;
+      prevAt = null;
+    }
+  }
+  if (runStart && prevAt) consider(runStart, prevAt);
+  return best;
+}
+
+function outOfSeasonReason(timing: TimingDto, month: number): WindowReasonDto {
+  const { fromMonth, toMonth } = timing.seasonWindow!;
+  return {
+    code: 'OUT_OF_SEASON',
+    level: 'bad',
+    text: `${month} 月不在设定季节窗口（${fromMonth}–${toMonth} 月）内`,
+  };
+}
+
+function isSeasonMonth(timing: TimingDto, month: number): boolean {
+  if (!timing.seasonWindow) return true;
+  const { fromMonth, toMonth } = timing.seasonWindow;
+  return fromMonth <= toMonth ? month >= fromMonth && month <= toMonth : month >= fromMonth || month <= toMonth;
+}
+
+/**
+ * 单日天文条件统一评估器——预览、可满足率、窗口判定**共用这一份代码**，
+ * 保证跨午夜多段区间与极区（极昼/极夜）在三处得到完全一致的结论。
+ * 只看天文与季节，不含天气。
+ */
+export function evaluateAstronomy(
+  lat: number,
+  lng: number,
+  tz: string,
+  dateKey: string,
+  timing: TimingDto,
+): AstronomyEvaluation {
+  const { month } = parseLocalDateKey(dateKey);
+  const events = sunEvents(lat, lng, tz, dateKey);
+  const reasons: WindowReasonDto[] = [];
+  events.notes.forEach((n) => reasons.push({ code: 'SUN_EVENT_NOTE', level: 'info', text: n }));
+
+  const failAll = (
+    extra: WindowReasonDto[],
+    anchorAt: Date = events.solarNoon,
+  ): AstronomyEvaluation => ({
+    date: dateKey,
+    anchorAt,
+    polar: events.polar,
+    verdict: 'bad',
+    reasons: [...reasons, ...extra],
+    segments: [],
+    bestSegment: null,
+    sunElevation: null,
+    sunAzimuth: null,
+    outOfSeason: extra.some((r) => r.code === 'OUT_OF_SEASON'),
+  });
+
+  if (!isSeasonMonth(timing, month)) {
+    return failAll([outOfSeasonReason(timing, month)]);
+  }
+
+  const resolved = resolveAnchor(events, timing);
+  if (!resolved) {
+    return failAll([
+      {
+        code: 'ANCHOR_UNRESOLVABLE',
+        level: 'bad',
+        text: '该日无法解析时间锚点（可能是极昼/极夜或偏移越界）',
+      },
+    ]);
+  }
+
+  resolved.notes.forEach((n) => reasons.push({ code: 'ANCHOR_NOTE', level: 'info', text: n }));
+  reasons.push({
+    code: 'ANCHOR_RESOLVED',
+    level: 'ok',
+    text: `${describeAnchor(timing)} → ${formatLocal(resolved.anchorAt, tz)}`,
+  });
+
+  const effectiveElevation = resolved.elevationRange ?? timing.elevationRange;
+  if (resolved.elevationRange) {
+    reasons.push({
+      code: 'ELEVATION_TARGET',
+      level: 'info',
+      text: `该锚点自带仰角区间 ${resolved.elevationRange[0]}°–${resolved.elevationRange[1]}°`,
+    });
+  }
+
+  const multi = timing.allowedIntervals.length > 0;
+  const arcs = effectiveAzimuthArcs(timing);
+  const multiLabel = timing.allowedIntervals.map(formatClockInterval);
+  const segments: AstronomySegment[] = [];
+
+  const rawRanges: { label: string; start: Date; end: Date }[] = multi
+    ? timing.allowedIntervals.map((iv, i) => ({
+        label: `区间 ${i + 1}（${multiLabel[i]}）`,
+        ...clockIntervalToUtc(dateKey, tz, iv),
+      }))
+    : [{ label: '', start: bandToRange(resolved, timing)[0], end: bandToRange(resolved, timing)[1] }];
+
+  rawRanges.forEach((range) => {
+    const segReasons: WindowReasonDto[] = [];
+    const stepMin = sampleStepMin(range.start, range.end);
+    const samples = sampleWindow(lat, lng, range.start, range.end, stepMin);
+    const prefix = multi ? `${range.label}：` : '';
+    // 单段（旧）路径在锚点处取实测值，与历史判定理由逐字一致；多段时锚点可能落在区间外，改用区间中点
+    const probeAt = multi ? new Date((range.start.getTime() + range.end.getTime()) / 2) : resolved.anchorAt;
+    const fmtElev = (v: number) => (multi ? `${v.toFixed(1)}°` : fmtDeg(v));
+
+    const reject = (r: WindowReasonDto, code: string, mid: SolarPosition | null = null): AstronomySegment => ({
+      label: range.label,
+      startAt: range.start,
+      endAt: range.end,
+      run: null,
+      reasons: [r],
+      rejected: true,
+      failureCode: code,
+      midPosition: mid,
+      durationMin: 0,
+      observed: null,
+    });
+
+    const elevOk = samples.filter((s) => elevationInRange(s.elevationDeg, effectiveElevation));
+    if (elevOk.length < 2) {
+      const mid = solarPosition(probeAt, lat, lng);
+      segments.push(
+        reject(
+          {
+            code: 'ELEVATION_MISS',
+            level: 'bad',
+            text: `${prefix}窗口内太阳仰角始终不在 ${effectiveElevation[0]}°–${effectiveElevation[1]}°（${multi ? '时段中点' : '锚点处'}实测 ${fmtElev(mid.elevationDeg)}）`,
+          },
+          'ELEVATION_MISS',
+          mid,
+        ),
+      );
+      return;
+    }
+    segReasons.push({
+      code: 'ELEVATION_OK',
+      level: 'ok',
+      text: `${prefix}窗口内仰角 ${fmtDeg(Math.min(...elevOk.map((s) => s.elevationDeg)))}–${fmtDeg(
+        Math.max(...elevOk.map((s) => s.elevationDeg)),
+      )}（目标 ${effectiveElevation[0]}°–${effectiveElevation[1]}°）`,
+    });
+
+    const candidateSamples = samples.map((s) => ({
+      ...s,
+      ok:
+        elevationInRange(s.elevationDeg, effectiveElevation) &&
+        (arcs.length === 0 || arcs.some((a) => azimuthArcContains(s.azimuthDeg, a))),
+    }));
+    const hit = candidateSamples.filter((s) => s.ok);
+    if (arcs.length > 0 && hit.length < 2) {
+      const mid = solarPosition(probeAt, lat, lng);
+      segments.push(
+        reject(
+          {
+            code: 'AZIMUTH_MISS',
+            level: 'bad',
+            text: `${prefix}太阳方位角始终不在 ${describeArcs(timing)}（${multi ? '时段中点' : '锚点处'}实测 ${fmtDeg(mid.azimuthDeg, 0)}）`,
+          },
+          'AZIMUTH_MISS',
+          mid,
+        ),
+      );
+      return;
+    }
+    if (arcs.length > 0) {
+      segReasons.push({
+        code: 'AZIMUTH_OK',
+        level: 'ok',
+        text: `${prefix}方位角命中 ${describeArcs(timing)}（${multi ? '实测' : '窗口内实测'} ${fmtDeg(
+          Math.min(...hit.map((s) => s.azimuthDeg)),
+          0,
+        )}–${fmtDeg(Math.max(...hit.map((s) => s.azimuthDeg)), 0)}）`,
+      });
+    }
+
+    const run = longestContiguousRun(candidateSamples);
+    if (!run) {
+      segments.push(
+        reject(
+          { code: 'WINDOW_EMPTY', level: 'bad', text: `${prefix}没有满足全部天文约束的时刻` },
+          'WINDOW_EMPTY',
+        ),
+      );
+      return;
+    }
+
+    const durationMin = (run.end.getTime() - run.start.getTime()) / 60000 + stepMin;
+    if (durationMin < 5) {
+      segReasons.push({
+        code: 'WINDOW_TOO_SHORT',
+        level: 'warn',
+        text: `${prefix}可用窗口仅约 ${durationMin.toFixed(0)} 分钟（少于 5 分钟）`,
+      });
+    }
+    segReasons.push({
+      code: 'WINDOW_RANGE',
+      level: 'ok',
+      text: `${prefix}窗口 ${formatLocal(run.start, tz)}–${formatLocal(run.end, tz)}（约 ${durationMin.toFixed(0)} 分钟）`,
+    });
+
+    segments.push({
+      label: range.label,
+      startAt: range.start,
+      endAt: range.end,
+      run,
+      reasons: segReasons,
+      rejected: false,
+      failureCode: null,
+      midPosition: solarPosition(new Date((run.start.getTime() + run.end.getTime()) / 2), lat, lng),
+      durationMin,
+      observed: {
+        elevMin: Math.min(...hit.map((s) => s.elevationDeg)),
+        elevMax: Math.max(...hit.map((s) => s.elevationDeg)),
+        azMin: Math.min(...hit.map((s) => s.azimuthDeg)),
+        azMax: Math.max(...hit.map((s) => s.azimuthDeg)),
+      },
+    });
+  });
+
+  const usable = segments.filter((s) => !s.rejected && s.run);
+  if (usable.length === 0) {
+    return {
+      date: dateKey,
+      anchorAt: resolved.anchorAt,
+      polar: events.polar,
+      verdict: 'bad',
+      reasons: [...reasons, ...segments.flatMap((s) => s.reasons)],
+      segments,
+      bestSegment: null,
+      sunElevation: segments[0]?.midPosition?.elevationDeg ?? null,
+      sunAzimuth: segments[0]?.midPosition?.azimuthDeg ?? null,
+      outOfSeason: false,
+    };
+  }
+
+  // 多段各自独立，挑最长的一段作为当日窗口
+  const best = usable.reduce((a, b) => (b.durationMin > a.durationMin ? b : a));
+  const verdict: AstronomyEvaluation['verdict'] = best.durationMin < 5 ? 'marginal' : 'good';
+
+  if (multi) {
+    reasons.push({
+      code: 'INTERVALS_PLAN',
+      level: 'info',
+      text: `当天按 ${timing.allowedIntervals.length} 段允许钟点判定：${multiLabel.join('、')}（机位时区 ${tz}）`,
+    });
+    segments.forEach((s) => {
+      if (s.rejected) {
+        reasons.push({
+          code: 'WINDOW_SEGMENT_SKIP',
+          level: 'info',
+          text: `${s.label}不成立，已跳过（${s.failureCode === 'ELEVATION_MISS' ? '仰角不符' : s.failureCode === 'AZIMUTH_MISS' ? '方位不符' : '无满足时刻'}）`,
+        });
+      }
+    });
+  }
+
+  return {
+    date: dateKey,
+    anchorAt: resolved.anchorAt,
+    polar: events.polar,
+    verdict,
+    reasons: [...reasons, ...segments.flatMap((s) => s.reasons)],
+    segments,
+    bestSegment: best,
+    sunElevation: best.midPosition!.elevationDeg,
+    sunAzimuth: best.midPosition!.azimuthDeg,
+    outOfSeason: false,
+  };
+}
+
+function describeArcs(timing: TimingDto): string {
+  if (timing.azimuthRange) {
+    const [azLo, azHi] = timing.azimuthRange;
+    return `${((azLo + azHi) / 2).toFixed(0)}°±${timing.azimuthTolerance}°`;
+  }
+  return timing.azimuthArcs
+    .map((a) => `${a.startDeg.toFixed(0)}°→${a.endDeg.toFixed(0)}°`)
+    .join(' 或 ');
+}
+
+function describeAnchor(timing: Pick<TimingDto, 'timeAnchor' | 'anchorOffsetMin'>): string {
+  switch (timing.timeAnchor) {
+    case 'sunrise_plus':
+      return `日出后 ${timing.anchorOffsetMin} 分`;
+    case 'sunset_minus':
+      return `日落前 ${Math.abs(timing.anchorOffsetMin)} 分`;
+    case 'fixed_clock':
+      return `固定钟点 ${String(Math.floor(timing.anchorOffsetMin / 60)).padStart(2, '0')}:${String(
+        Math.round(timing.anchorOffsetMin % 60),
+      ).padStart(2, '0')}`;
+    default:
+      return timing.timeAnchor;
+  }
 }

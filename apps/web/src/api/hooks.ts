@@ -158,8 +158,19 @@ export function usePreviewTiming() {
     mutationFn: ({ id, timing }: { id: string; timing: TimingDto }) =>
       post<{
         anchorLocal: string | null;
+        polarity: 'none' | 'midnight_sun' | 'polar_night';
+        verdict: 'good' | 'marginal' | 'bad';
         sunEvents: Record<string, string | null>;
         notes: string[];
+        segments: {
+          label: string;
+          startLocal: string;
+          endLocal: string;
+          windowLocal: string | null;
+          verdict: 'good' | 'marginal' | 'bad';
+          durationMin: number;
+          reasons: { code: string; level: 'ok' | 'warn' | 'bad' | 'info'; text: string }[];
+        }[];
         satisfiability: { total: number; satisfied: number; ratio: number; advice: string | null };
       }>(`/inspirations/${id}/timing/preview`, timing),
   });

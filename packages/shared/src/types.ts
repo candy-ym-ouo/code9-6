@@ -28,13 +28,37 @@ export interface WeatherProfile {
   hardRequirements?: string[];
 }
 
+/**
+ * 机位时区本地钟点区间（分钟）。
+ * endMin <= startMin 表示跨午夜（结束落在次日）；endMin 可取 1440 = 次日 00:00。
+ * 例：{ startMin: 23*60, endMin: 60 } = 当天 23:00 – 次日 01:00。
+ */
+export interface ClockInterval {
+  startMin: number;
+  endMin: number;
+}
+
+/**
+ * 顺时针方位角圆弧（度，0=正北，顺时针增大）。
+ * endDeg <= startDeg 表示跨过 0°/360°，例：{ startDeg: 350, endDeg: 10 } = 350°→10° 的 20° 弧。
+ * 起终点相等是零宽弧，属无效输入（见 validateTiming）。
+ */
+export interface AzimuthArc {
+  startDeg: number;
+  endDeg: number;
+}
+
 export interface TimingDto {
   timeAnchor: TimeAnchor;
   anchorOffsetMin: number;
   elevationRange: number[];
   azimuthRange: number[] | null;
+  /** 多段允许方位角圆弧（顺时针，可跨正北）；与 azimuthRange 二选一 */
+  azimuthArcs: AzimuthArc[];
   azimuthTolerance: number;
   windowToleranceMin: number;
+  /** 多段允许钟点区间（机位本地时区，可跨午夜）；空数组 = 沿用锚点窗口/容差 */
+  allowedIntervals: ClockInterval[];
   weatherProfile: WeatherProfile;
   seasonWindow: { fromMonth: number; toMonth: number } | null;
   notes: string | null;

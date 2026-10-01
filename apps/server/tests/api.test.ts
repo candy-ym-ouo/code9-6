@@ -447,3 +447,109 @@ describe('E10 备份与质量门', () => {
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
   });
 });
+
+describe('E2b 时间锚：多段允许区间 / 无效方位范围', () => {
+  const baseTiming = {
+    timeAnchor: 'sunset_minus',
+    anchorOffsetMin: 40,
+    elevationRange: [-4, 10],
+    azimuthRange: null,
+    azimuthArcs: [],
+    azimuthTolerance: 15,
+    windowToleranceMin: 12,
+    allowedIntervals: [],
+    weatherProfile: {},
+    seasonWindow: null,
+    notes: null,
+  };
+
+  it('零宽方位弧在保存时被可解释拒绝（400 + 逐条 issues）', async () => {
+    const res = await call('put', `/api/inspirations/${cardId}/timing`, {
+      ...baseTiming,
+      azimuthRange: null,
+      azimuthArcs: [{ startDeg: 90, endDeg: 90 }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/零宽/);
+    expect(Array.isArray(res.body.error.details.issues)).toBe(true);
+    expect(res.body.error.details.issues[0].path).toMatch(/azimuthArcs/);
+  });
+
+  it('预览接口同样拒绝零宽方位弧（保存与预览口径一致）', async () => {
+    const res = await call('post', `/api/inspirations/${cardId}/timing/preview`, {
+      ...baseTiming,
+      azimuthArcs: [{ startDeg: 45, endDeg: 45 }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/零宽/);
+  });
+
+  it('同时给方位中心和方位弧被拒绝', async () => {
+    const res = await call('put', `/api/inspirations/${cardId}/timing`, {
+      ...baseTiming,
+      azimuthRange: [100, 100],
+      azimuthArcs: [{ startDeg: 0, endDeg: 90 }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/不能同时/);
+  });
+
+  it('仰角区间反向（下界>上界）被拒绝并说明原因', async () => {
+    const res = await call('put', `/api/inspirations/${cardId}/timing`, {
+      ...baseTiming,
+      elevationRange: [20, 10],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/方向反了/);
+  });
+
+  it('零长度钟点区间被拒绝', async () => {
+    const res = await call('put', `/api/inspirations/${cardId}/timing`, {
+      ...baseTiming,
+      allowedIntervals: [{ startMin: 300, endMin: 300 }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/零长度/);
+  });
+
+  it('多段允许区间（含跨午夜）可保存、回读、重算窗口，且预览逐段返回', async () => {
+    const body = {
+      ...baseTiming,
+      elevationRange: [-90, 90],
+      allowedIntervals: [
+        { startMin: 22 * 60, endMin: 2 * 60 }, // 跨午夜
+        { startMin: 16 * 60 + 30, endMin: 17 * 60 + 10 },
+      ],
+    };
+    const saved = await call('put', `/api/inspirations/${cardId}/timing`, body);
+    expect(saved.status).toBe(200);
+    expect(saved.body.item.allowedIntervals).toEqual(body.allowedIntervals);
+    expect(saved.body.windows).toHaveLength(7);
+
+    const detail = await call('get', `/api/inspirations/${cardId}/timing`);
+    expect(detail.body.item.allowedIntervals).toEqual(body.allowedIntervals);
+
+    const preview = await call('post', `/api/inspirations/${cardId}/timing/preview`, body);
+    expect(preview.status).toBe(200);
+    expect(preview.body.segments).toHaveLength(2);
+    // 每段都带跨日展开后的本地钟点与可复算理由
+    for (const s of preview.body.segments) {
+      expect(s.startLocal).toMatch(/2026-/);
+      expect(Array.isArray(s.reasons)).toBe(true);
+    }
+    // 可满足率与窗口判定同源（同一天结论一致）
+    expect(typeof preview.body.satisfiability.ratio).toBe('number');
+  });
+
+  it('多段方位弧（跨正北）可保存并在预览返回非空 segments', async () => {
+    const body = {
+      ...baseTiming,
+      azimuthRange: null,
+      azimuthArcs: [{ startDeg: 350, endDeg: 10 }],
+      allowedIntervals: [],
+    };
+    const preview = await call('post', `/api/inspirations/${cardId}/timing/preview`, body);
+    expect(preview.status).toBe(200);
+    expect(preview.body.segments).toHaveLength(1);
+  });
+});

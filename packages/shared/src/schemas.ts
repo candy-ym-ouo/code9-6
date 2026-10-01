@@ -29,13 +29,25 @@ export const weatherProfileSchema = z.object({
   hardRequirements: z.array(z.string()).optional(),
 });
 
+const clockIntervalSchema = z.object({
+  startMin: z.number().int().min(0).max(1439),
+  endMin: z.number().int().min(0).max(1440),
+});
+
+const azimuthArcSchema = z.object({
+  startDeg: z.number().min(0).max(360),
+  endDeg: z.number().min(0).max(360),
+});
+
 export const timingSchema = z.object({
   timeAnchor: zEnum(TimeAnchor),
   anchorOffsetMin: z.number().int().min(-1440).max(1440).default(0),
   elevationRange: z.array(z.number()).length(2).default([-90, 90]),
   azimuthRange: z.array(z.number()).length(2).nullable().default(null),
+  azimuthArcs: z.array(azimuthArcSchema).max(6).default([]),
   azimuthTolerance: z.number().min(0).max(180).default(15),
   windowToleranceMin: z.number().int().min(1).max(180).default(12),
+  allowedIntervals: z.array(clockIntervalSchema).max(6).default([]),
   weatherProfile: weatherProfileSchema.default({}),
   seasonWindow: z
     .object({ fromMonth: z.number().int().min(1).max(12), toMonth: z.number().int().min(1).max(12) })
