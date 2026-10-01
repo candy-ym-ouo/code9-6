@@ -1,6 +1,6 @@
-import type { MissReason } from '@flil/shared';
+import type { MissReason, TimingDto } from '@flil/shared';
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
-import { loadTiming } from './windowEngine.js';
+import { loadTiming, patchTimingRecord, timingRowToDto } from './windowEngine.js';
 import { touch } from './inspirations.js';
 
 export interface CalibrationOutcome {
@@ -93,42 +93,48 @@ export function applyCalibration(
   const suggestions: string[] = [];
 
   const timingRow = loadTiming(inspirationId);
+  const currentDto = timingRow ? timingRowToDto(timingRow) : null;
   const recent3 = results.slice(0, 3);
   const allMissSameCause =
     recent3.length === 3 &&
     recent3.every((r) => r.hit_level === 'miss') &&
     recent3.every((r) => r.miss_reasons.some((m) => m === 'timing_off' || m === 'weather_mismatch'));
 
-  if (timingRow && allMissSameCause) {
-    if (timingRow.azimuth_tolerance > 8) {
-      const before = timingRow.azimuth_tolerance;
+  /** 收紧结果必须同步到每个允许时段（多段之间保持同一套容差，可解释、可整体撤销）。 */
+  const applyToIntervals = (fn: (iv: NonNullable<TimingDto['intervals']>[number]) => void) => {
+    if (!currentDto?.intervals) return;
+    currentDto.intervals.forEach(fn);
+  };
+
+  if (timingRow && currentDto && allMissSameCause) {
+    const minAzimuth = Math.min(...currentDto.intervals!.map((iv) => iv.azimuthTolerance));
+    if (minAzimuth > 8) {
+      const before = minAzimuth;
       const after = Math.max(8, before - 5);
-      db.prepare('UPDATE timing SET azimuth_tolerance = ?, updated_at = ? WHERE id = ?').run(
-        after,
-        nowIso(),
-        timingRow.id,
-      );
+      applyToIntervals((iv) => {
+        iv.azimuthTolerance = Math.max(8, iv.azimuthTolerance - 5);
+      });
+      patchTimingRecord(inspirationId, { intervals: currentDto.intervals });
       logCalibration(
         libraryId,
         inspirationId,
         'azimuth_tolerance',
         before,
         after,
-        '连续 3 次未命中且原因为时间/天气偏差，方位角容差收紧一档',
+        '连续 3 次未命中且原因为时间/天气偏差，方位角容差收紧一档（已同步到全部允许时段）',
         triggeredBy,
       );
       tightened.push({ field: 'azimuth_tolerance', before, after });
     } else {
-      const profile = parseJson<{ cloudCoverPct?: { min: number; max: number } }>(timingRow.weather_profile, {});
-      if (profile.cloudCoverPct && profile.cloudCoverPct.max - profile.cloudCoverPct.min > 15) {
+      const profile = currentDto.weatherProfile;
+      const anyWideCloud = (currentDto.intervals ?? []).length > 0 && profile.cloudCoverPct
+        ? profile.cloudCoverPct.max - profile.cloudCoverPct.min > 15
+        : false;
+      if (anyWideCloud && profile.cloudCoverPct) {
         const before = { ...profile.cloudCoverPct };
         const after = { min: profile.cloudCoverPct.min + 5, max: profile.cloudCoverPct.max - 5 };
         profile.cloudCoverPct = after;
-        db.prepare('UPDATE timing SET weather_profile = ?, updated_at = ? WHERE id = ?').run(
-          toJson(profile),
-          nowIso(),
-          timingRow.id,
-        );
+        patchTimingRecord(inspirationId, { weatherProfile: profile });
         logCalibration(
           libraryId,
           inspirationId,
@@ -139,24 +145,26 @@ export function applyCalibration(
           triggeredBy,
         );
         tightened.push({ field: 'cloudCoverPct', before, after });
-      } else if (timingRow.window_tolerance_min > 6) {
-        const before = timingRow.window_tolerance_min;
-        const after = Math.max(6, before - 3);
-        db.prepare('UPDATE timing SET window_tolerance_min = ?, updated_at = ? WHERE id = ?').run(
-          after,
-          nowIso(),
-          timingRow.id,
-        );
-        logCalibration(
-          libraryId,
-          inspirationId,
-          'window_tolerance_min',
-          before,
-          after,
-          '连续 3 次未命中且原因为时间偏差，窗口容差收紧一档',
-          triggeredBy,
-        );
-        tightened.push({ field: 'window_tolerance_min', before, after });
+      } else {
+        const minTol = Math.min(...currentDto.intervals!.map((iv) => iv.windowToleranceMin));
+        if (minTol > 6) {
+          const before = minTol;
+          const after = Math.max(6, before - 3);
+          applyToIntervals((iv) => {
+            iv.windowToleranceMin = Math.max(6, iv.windowToleranceMin - 3);
+          });
+          patchTimingRecord(inspirationId, { intervals: currentDto.intervals });
+          logCalibration(
+            libraryId,
+            inspirationId,
+            'window_tolerance_min',
+            before,
+            after,
+            '连续 3 次未命中且原因为时间偏差，窗口容差收紧一档（已同步到全部允许时段）',
+            triggeredBy,
+          );
+          tightened.push({ field: 'window_tolerance_min', before, after });
+        }
       }
     }
   }
@@ -187,7 +195,7 @@ export function listCalibration(inspirationId: string): Record<string, unknown>[
   }));
 }
 
-/** 撤销一次收窄（校准必须可回溯、可撤销） */
+/** 撤销一次收窄（校准必须可回溯、可撤销；撤销同样要回写全部允许时段） */
 export function undoCalibration(calibrationId: string, libraryId: string, inspirationId: string): void {
   const db = getDb();
   const row = db
@@ -197,17 +205,26 @@ export function undoCalibration(calibrationId: string, libraryId: string, inspir
 
   const field = row.field as string;
   const before = parseJson<unknown>(row.before_value, null);
-  const timing = loadTiming(inspirationId);
-  if (timing) {
-    if (field === 'azimuth_tolerance') {
-      db.prepare('UPDATE timing SET azimuth_tolerance = ? WHERE id = ?').run(before as number, timing.id);
-    } else if (field === 'window_tolerance_min') {
-      db.prepare('UPDATE timing SET window_tolerance_min = ? WHERE id = ?').run(before as number, timing.id);
-    } else if (field === 'weather_profile') {
-      const profile = parseJson<{ cloudCoverPct?: unknown }>(timing.weather_profile, {});
-      profile.cloudCoverPct = before as { min: number; max: number };
-      db.prepare('UPDATE timing SET weather_profile = ? WHERE id = ?').run(toJson(profile), timing.id);
-    }
+  const timingRow = loadTiming(inspirationId);
+  if (!timingRow) {
+    db.prepare('UPDATE calibration_log SET undone_at = ? WHERE id = ?').run(nowIso(), calibrationId);
+    return;
+  }
+  const dto = timingRowToDto(timingRow);
+  if (field === 'azimuth_tolerance') {
+    dto.intervals?.forEach((iv) => {
+      iv.azimuthTolerance = before as number;
+    });
+    patchTimingRecord(inspirationId, { intervals: dto.intervals });
+  } else if (field === 'window_tolerance_min') {
+    dto.intervals?.forEach((iv) => {
+      iv.windowToleranceMin = before as number;
+    });
+    patchTimingRecord(inspirationId, { intervals: dto.intervals });
+  } else if (field === 'weather_profile') {
+    const profile = dto.weatherProfile;
+    profile.cloudCoverPct = before as { min: number; max: number };
+    patchTimingRecord(inspirationId, { weatherProfile: profile });
   }
   db.prepare('UPDATE calibration_log SET undone_at = ? WHERE id = ?').run(nowIso(), calibrationId);
 }

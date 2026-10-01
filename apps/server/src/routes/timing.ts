@@ -1,12 +1,13 @@
 import { Router } from 'express';
-import { z } from 'zod';
 import {
   addDaysToKey,
   distanceBand,
   distanceKm,
+  evaluateDay,
   formatLocal,
   localDateKey,
-  resolveAnchor,
+  normalizeTiming,
+  describeIntervalAnchor,
   sunEvents,
   theoreticalOkForDay,
   theoreticalDaysInYear,
@@ -33,7 +34,9 @@ import { toInspirationDto } from '../services/serialization.js';
 export const timingRouter = Router();
 timingRouter.use(authenticate());
 
-function upsertTiming(libraryId: string, inspirationId: string, input: TimingDto): void {
+function upsertTiming(libraryId: string, inspirationId: string, rawInput: TimingDto): void {
+  // 归一化后再落库：多段写入 intervals JSON；顶层旧字段镜像第一段，兼容旧读取路径。
+  const input = normalizeTiming(rawInput);
   const db = getDb();
   const ts = nowIso();
   const existing = loadTiming(inspirationId);
@@ -46,20 +49,21 @@ function upsertTiming(libraryId: string, inspirationId: string, input: TimingDto
     input.windowToleranceMin,
     toJson(input.weatherProfile),
     input.seasonWindow ? toJson(input.seasonWindow) : null,
+    toJson(input.intervals ?? []),
     input.notes,
   ];
   if (existing) {
     db.prepare(
       `UPDATE timing SET time_anchor = ?, anchor_offset_min = ?, elevation_range = ?, azimuth_range = ?,
-         azimuth_tolerance = ?, window_tolerance_min = ?, weather_profile = ?, season_window = ?, notes = ?,
-         updated_at = ? WHERE id = ?`,
+         azimuth_tolerance = ?, window_tolerance_min = ?, weather_profile = ?, season_window = ?,
+         intervals = ?, notes = ?, updated_at = ? WHERE id = ?`,
     ).run(...(values as never[]), ts, existing.id);
   } else {
     db.prepare(
       `INSERT INTO timing (id, library_id, inspiration_id, time_anchor, anchor_offset_min, elevation_range,
-         azimuth_range, azimuth_tolerance, window_tolerance_min, weather_profile, season_window, notes,
-         created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         azimuth_range, azimuth_tolerance, window_tolerance_min, weather_profile, season_window, intervals,
+         notes, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(newId(), libraryId, inspirationId, ...(values as never[]), ts, ts);
   }
 }
@@ -79,7 +83,7 @@ timingRouter.put(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     const row = requireInspiration(req.params.id, ctx.libraryId);
-    const input = timingSchema.parse(req.body) as TimingDto;
+    const input = normalizeTiming(timingSchema.parse(req.body) as TimingDto);
     upsertTiming(ctx.libraryId, row.id, input);
     syncStatus(row.id);
 
@@ -91,29 +95,64 @@ timingRouter.put(
   }),
 );
 
-/** 锚点解析预览：告诉用户"你说的这个锚点，今天对应几点、仰角多少" */
+/** 锚点解析预览：告诉用户"你说的这些时段，今天对应几点、仰角多少"，并逐段给出可复算结论 */
 timingRouter.post(
   '/inspirations/:id/timing/preview',
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     const row = requireInspiration(req.params.id, ctx.libraryId);
-    const input = timingSchema.parse(req.body) as TimingDto;
+    const input = normalizeTiming(timingSchema.parse(req.body) as TimingDto);
     if (!row.spot_id) throw errors.badRequest('该卡片还没有机位，先把机位定下来');
     const spot = loadSpotGeom(row.spot_id);
     if (!spot) throw errors.badRequest('机位不存在');
 
     const today = localDateKey(new Date(), spot.tz);
-    const events = sunEvents(spot.lat, spot.lng, spot.tz, today);
-    const resolved = resolveAnchor(events, input);
+    const day = evaluateDay(spot.lat, spot.lng, spot.tz, today, input, sunEvents);
+    const events = day.events;
+
+    const intervalPreviews = day.intervals.map((iv) => ({
+      index: iv.index,
+      label: iv.interval.label ?? null,
+      anchor: describeIntervalAnchor(iv.interval),
+      anchorAt: iv.anchorAt ? iv.anchorAt.toISOString() : null,
+      anchorLocal: iv.anchorAt ? formatLocal(iv.anchorAt, spot.tz) : null,
+      band: iv.band
+        ? {
+            start: iv.band.start.toISOString(),
+            end: iv.band.end.toISOString(),
+            startLocal: formatLocal(iv.band.start, spot.tz, true),
+            endLocal: formatLocal(iv.band.end, spot.tz, true),
+            crossesMidnight:
+              iv.band.start.toISOString().slice(0, 10) !== iv.band.end.toISOString().slice(0, 10) ||
+              formatLocal(iv.band.start, spot.tz) > formatLocal(iv.band.end, spot.tz),
+          }
+        : null,
+      status: iv.status,
+      satisfiable: iv.status === 'ok',
+      elevationRange: iv.effectiveElevationRange ?? iv.interval.elevationRange,
+      measured: {
+        anchorElevation: iv.measured.anchorPosition?.elevationDeg ?? null,
+        anchorAzimuth: iv.measured.anchorPosition?.azimuthDeg ?? null,
+        elevationMin: iv.measured.elevationMin,
+        elevationMax: iv.measured.elevationMax,
+      },
+      notes: iv.notes,
+    }));
 
     const sat = await satisfactionRate(spot.lat, spot.lng, spot.tz, input, 30);
+    const best = day.best;
     ok(res, {
       date: today,
-      anchorAt: resolved ? resolved.anchorAt.toISOString() : null,
-      anchorLocal: resolved ? formatLocal(resolved.anchorAt, spot.tz) : null,
-      elevationRange: resolved?.elevationRange ?? input.elevationRange,
+      // 兼容旧前端的顶层字段（取最长可行段；全部不可行则取第一段）
+      anchorAt: best?.anchorAt ? best.anchorAt.toISOString() : intervalPreviews[0]?.anchorAt ?? null,
+      anchorLocal: best?.anchorAt
+        ? formatLocal(best.anchorAt, spot.tz)
+        : intervalPreviews[0]?.anchorLocal ?? null,
+      elevationRange: best?.effectiveElevationRange ?? input.elevationRange,
       polarity: events.polar,
-      notes: [...events.notes, ...(resolved?.notes ?? [])],
+      satisfiable: day.satisfiable,
+      intervals: intervalPreviews,
+      notes: [...events.notes, ...day.intervals.flatMap((iv) => iv.notes)],
       sunEvents: {
         sunrise: events.sunrise ? formatLocal(events.sunrise, spot.tz) : null,
         sunset: events.sunset ? formatLocal(events.sunset, spot.tz) : null,
@@ -127,20 +166,24 @@ timingRouter.post(
         bluePm: events.bluePm
           ? `${formatLocal(events.bluePm.start, spot.tz)}–${formatLocal(events.bluePm.end, spot.tz)}`
           : null,
+        nightStart: events.nightStart ? formatLocal(events.nightStart, spot.tz, true) : null,
+        nightEnd: events.nightEnd ? formatLocal(events.nightEnd, spot.tz, true) : null,
       },
       satisfiability: sat,
     });
   }),
 );
 
-/** 可满足性检查：近 N 天过去无法满足时给出放宽建议（文档 10.2③ / 20 风险表） */
+/** 可满足性检查：近 N 天过去无法满足时给出放宽建议（文档 10.2③ / 20 风险表）。
+ *  纯天文判定走共享层 theoreticalOkForDay，与预览、逐日窗口判定是同一份结论。 */
 async function satisfactionRate(
   lat: number,
   lng: number,
   tz: string,
-  timing: TimingDto,
+  rawTiming: TimingDto,
   days: number,
 ): Promise<{ total: number; satisfied: number; ratio: number; advice: string | null }> {
+  const timing = normalizeTiming(rawTiming);
   const forecast = await getForecast(lat, lng, Math.min(16, days));
   const today = localDateKey(new Date(), tz);
   const results: { date: string; ok: boolean }[] = [];
@@ -150,9 +193,13 @@ async function satisfactionRate(
   }
   const satisfied = results.filter((r) => r.ok).length;
   const ratio = results.length ? satisfied / results.length : 0;
+  const segments = timing.intervals?.length ?? 1;
   let advice: string | null = null;
   if (results.length && satisfied === 0) {
-    advice = `未来 ${days} 天该条件在理论上都无法成立，建议放宽仰角区间、方位角容差或季节窗口。`;
+    advice =
+      segments > 1
+        ? `未来 ${days} 天全部 ${segments} 个允许时段在理论上都无法成立，建议为某个时段放宽仰角区间、方位角容差，或改选在极区仍可解析的锚点（如正午/固定钟点）。`
+        : `未来 ${days} 天该条件在理论上都无法成立，建议放宽仰角区间、方位角容差或季节窗口。`;
   } else if (results.length && ratio < 0.1) {
     advice = `未来 ${days} 天仅 ${satisfied} 天可能成立，条件偏严；如果长期没有窗口，可以适当放宽。`;
   }

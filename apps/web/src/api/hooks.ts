@@ -160,9 +160,26 @@ export function usePreviewTiming() {
         anchorLocal: string | null;
         sunEvents: Record<string, string | null>;
         notes: string[];
+        polarity: string;
+        satisfiable: boolean;
+        intervals?: PreviewInterval[];
         satisfiability: { total: number; satisfied: number; ratio: number; advice: string | null };
       }>(`/inspirations/${id}/timing/preview`, timing),
   });
+}
+
+export interface PreviewInterval {
+  index: number;
+  label: string | null;
+  anchor: string;
+  anchorAt: string | null;
+  anchorLocal: string | null;
+  band: { startLocal: string; endLocal: string; crossesMidnight: boolean } | null;
+  status: 'ok' | 'anchor_unresolved' | 'elevation_miss' | 'azimuth_miss';
+  satisfiable: boolean;
+  elevationRange: number[];
+  measured: { anchorElevation: number | null; anchorAzimuth: number | null; elevationMin: number; elevationMax: number };
+  notes: string[];
 }
 
 export function useRecomputeWindows() {

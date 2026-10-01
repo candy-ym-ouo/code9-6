@@ -142,6 +142,60 @@ async function main() {
   check('锚点解析出今天的真实时刻', typeof preview.json?.anchorLocal === 'string', JSON.stringify(preview.json));
   check('给出可满足性建议字段', 'satisfiability' in (preview.json ?? {}));
 
+  // 7b. 无效方位区间可解释拒绝；跨 0°/360° 接缝的合法弧与多段时段可试算
+  const badArc = await req('POST', `/inspirations/${cardId}/timing/preview`, {
+    timeAnchor: 'sunset_minus',
+    anchorOffsetMin: 40,
+    elevationRange: [-4, 10],
+    azimuthRange: [10, 350], // 顺时针跨 340°，超过 180° 上限
+    azimuthTolerance: 15,
+    windowToleranceMin: 12,
+    weatherProfile: {},
+    seasonWindow: null,
+    notes: null,
+  });
+  check('无效方位区间被 400 拒绝', badArc.status === 400, String(badArc.status));
+  check(
+    '拒绝理由可解释（指出顺时针跨度与 180° 上限）',
+    /顺时针|180/.test(JSON.stringify(badArc.json?.error?.details ?? '')),
+    JSON.stringify(badArc.json?.error),
+  );
+
+  const wrapArc = await req('POST', `/inspirations/${cardId}/timing/preview`, {
+    timeAnchor: 'sunset_minus',
+    anchorOffsetMin: 40,
+    elevationRange: [-4, 10],
+    azimuthRange: [350, 10], // 跨正北接缝的 20° 小弧，合法
+    azimuthTolerance: 15,
+    windowToleranceMin: 12,
+    weatherProfile: {},
+    seasonWindow: null,
+    notes: null,
+  });
+  check('跨正北接缝的合法方位弧可试算', wrapArc.status === 200 && Array.isArray(wrapArc.json?.intervals), String(wrapArc.status));
+
+  const multi = await req('POST', `/inspirations/${cardId}/timing/preview`, {
+    timeAnchor: 'sunset_minus',
+    anchorOffsetMin: 40,
+    elevationRange: [-4, 10],
+    azimuthRange: null,
+    azimuthTolerance: 15,
+    windowToleranceMin: 12,
+    intervals: [
+      { timeAnchor: 'sunset_minus', anchorOffsetMin: 40, elevationRange: [-4, 10], azimuthRange: null, azimuthTolerance: 15, windowToleranceMin: 12 },
+      { timeAnchor: 'solar_noon', anchorOffsetMin: 0, elevationRange: [0, 60], azimuthRange: null, azimuthTolerance: 15, windowToleranceMin: 30 },
+    ],
+    weatherProfile: {},
+    seasonWindow: null,
+    notes: null,
+  });
+  check('多段允许区间逐段返回预览（或关系）', (multi.json?.intervals ?? []).length === 2, JSON.stringify(multi.json));
+  check(
+    '多段预览至少一段在该日天文可成立',
+    (multi.json?.intervals ?? []).some((iv) => iv.satisfiable),
+    JSON.stringify(multi.json?.intervals?.map((iv) => iv.status)),
+  );
+
   const timing = await req('PUT', `/inspirations/${cardId}/timing`, {
     timeAnchor: 'sunset_minus',
     anchorOffsetMin: 40,

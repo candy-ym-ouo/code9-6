@@ -1,16 +1,14 @@
 import {
   addDaysToKey,
   addMinutes,
-  angularDistance,
-  bandToRange,
-  elevationInRange,
+  describeIntervalAnchor,
+  evaluateDay,
   formatLocal,
   localDateKey,
-  parseLocalDateKey,
-  resolveAnchor,
-  sampleWindow,
-  solarPosition,
+  normalizeTiming,
   sunEvents,
+  type DayEvaluation,
+  type IntervalEvaluation,
   type ReproWindowDto,
   type TimingDto,
   type WeatherPhenomenon,
@@ -40,6 +38,7 @@ export interface TimingRow {
   window_tolerance_min: number;
   weather_profile: string;
   season_window: string | null;
+  intervals: string | null;
   repeat_rule: string | null;
   notes: string | null;
 }
@@ -52,8 +51,9 @@ export interface SpotGeom {
   tz: string;
 }
 
+/** 读出的 timing 行统一归一化：旧行没有 intervals 时由顶层字段合成唯一段。 */
 export function timingRowToDto(row: TimingRow): TimingDto {
-  return {
+  const dto: TimingDto = {
     timeAnchor: row.time_anchor,
     anchorOffsetMin: row.anchor_offset_min,
     elevationRange: parseJson<number[]>(row.elevation_range, [-90, 90]),
@@ -66,6 +66,11 @@ export function timingRowToDto(row: TimingRow): TimingDto {
       : null,
     notes: row.notes,
   };
+  if (row.intervals) {
+    const intervals = parseJson<TimingDto['intervals']>(row.intervals, undefined);
+    if (Array.isArray(intervals) && intervals.length > 0) dto.intervals = intervals;
+  }
+  return normalizeTiming(dto);
 }
 
 export function loadTiming(inspirationId: string): TimingRow | null {
@@ -73,6 +78,41 @@ export function loadTiming(inspirationId: string): TimingRow | null {
     (getDb().prepare('SELECT * FROM timing WHERE inspiration_id = ?').get(inspirationId) as TimingRow | undefined) ??
     null
   );
+}
+
+/**
+ * 统一的 timing 落库入口：应用 DTO 级补丁后同时写顶层旧字段与多段 JSON，
+ * 保证校准（calibration）等只改某一个字段的调用方不会让顶层/多段出现两份不一致的值。
+ */
+export function patchTimingRecord(
+  inspirationId: string,
+  patch: Partial<TimingDto>,
+  ts = nowIso(),
+): TimingDto | null {
+  const existing = loadTiming(inspirationId);
+  if (!existing) return null;
+  const next = normalizeTiming({ ...timingRowToDto(existing), ...patch });
+  getDb()
+    .prepare(
+      `UPDATE timing SET time_anchor=?, anchor_offset_min=?, elevation_range=?, azimuth_range=?,
+         azimuth_tolerance=?, window_tolerance_min=?, weather_profile=?, season_window=?,
+         intervals=?, notes=?, updated_at=? WHERE id=?`,
+    )
+    .run(
+      next.timeAnchor,
+      next.anchorOffsetMin,
+      toJson(next.elevationRange),
+      next.azimuthRange ? toJson(next.azimuthRange) : null,
+      next.azimuthTolerance,
+      next.windowToleranceMin,
+      toJson(next.weatherProfile),
+      next.seasonWindow ? toJson(next.seasonWindow) : null,
+      toJson(next.intervals ?? []),
+      next.notes,
+      ts,
+      existing.id,
+    );
+  return next;
 }
 
 export function loadSpotGeom(spotId: string): SpotGeom | null {
@@ -94,100 +134,130 @@ interface DayResult {
   episode: EpisodeWeather | null;
 }
 
-const CONTIGUOUS_GAP_MIN = 6;
-
-/** 找出满足条件的最长连续时间段 */
-function longestRun(
-  samples: { at: Date; ok: boolean }[],
-): { start: Date; end: Date } | null {
-  let best: { start: Date; end: Date } | null = null;
-  let runStart: Date | null = null;
-  let prevAt: Date | null = null;
-
-  for (const s of samples) {
-    if (s.ok) {
-      if (!runStart) runStart = s.at;
-      else if (prevAt && (s.at.getTime() - prevAt.getTime()) / 60000 > CONTIGUOUS_GAP_MIN) {
-        const candidate = { start: runStart, end: prevAt };
-        if (!best || candidate.end.getTime() - candidate.start.getTime() > best.end.getTime() - best.start.getTime()) {
-          best = candidate;
-        }
-        runStart = s.at;
-      }
-      prevAt = s.at;
-    } else if (runStart && prevAt) {
-      const candidate = { start: runStart, end: prevAt };
-      if (!best || candidate.end.getTime() - candidate.start.getTime() > best.end.getTime() - best.start.getTime()) {
-        best = candidate;
-      }
-      runStart = null;
-      prevAt = null;
-    }
-  }
-  if (runStart && prevAt) {
-    const candidate = { start: runStart, end: prevAt };
-    if (!best || candidate.end.getTime() - candidate.start.getTime() > best.end.getTime() - best.start.getTime()) {
-      best = candidate;
-    }
-  }
-  return best;
-}
-
 function fmtDeg(v: number | null | undefined, digits = 1): string {
   return v === null || v === undefined ? '未知' : `${v.toFixed(digits)}°`;
 }
 
-/** 判定单日窗口（文档 12.4 的算法，逐项产出 reasons） */
+function intervalLabel(ev: IntervalEvaluation): string {
+  const n = ev.interval.label?.trim();
+  const base = describeIntervalAnchor(ev.interval);
+  return n ? `第 ${ev.index + 1} 段「${n}」（${base}）` : `第 ${ev.index + 1} 段（${base}）`;
+}
+
+/** 把共享层的结构化单段求值转成中文理由；ok 段返回 null 以外的统计理由。 */
+function intervalReasons(ev: IntervalEvaluation, tz: string): WindowReasonDto[] {
+  const out: WindowReasonDto[] = [];
+  const label = intervalLabel(ev);
+  const iv = ev.interval;
+
+  if (ev.status === 'anchor_unresolved') {
+    out.push({
+      code: 'ANCHOR_UNRESOLVABLE',
+      level: 'bad',
+      text: `${label}：该日无法解析时间锚点（极昼/极夜或该日无此太阳事件）`,
+    });
+    ev.notes.forEach((n) =>
+      out.push({ code: 'ANCHOR_NOTE', level: 'info', text: `${label}：${n}` }),
+    );
+    return out;
+  }
+
+  out.push({
+    code: 'ANCHOR_RESOLVED',
+    level: 'ok',
+    text: `${label} → ${formatLocal(ev.anchorAt!, tz)}`,
+  });
+  ev.notes.forEach((n) => out.push({ code: 'ANCHOR_NOTE', level: 'info', text: `${label}：${n}` }));
+  if (ev.resolved?.elevationRange) {
+    out.push({
+      code: 'ELEVATION_TARGET',
+      level: 'info',
+      text: `${label}：该锚点自带仰角区间 ${ev.resolved.elevationRange[0]}°–${ev.resolved.elevationRange[1]}°`,
+    });
+  }
+
+  const [lo, hi] = ev.effectiveElevationRange ?? [-90, 90];
+  if (ev.status === 'elevation_miss') {
+    const anchorBand = ev.resolved?.elevationRange;
+    if (anchorBand) {
+      const userRange = ev.interval.elevationRange;
+      const noOverlap =
+        Math.max(userRange[0], anchorBand[0]) > Math.min(userRange[1], anchorBand[1]) + 1e-9;
+      if (noOverlap) {
+        out.push({
+          code: 'ELEVATION_MISS',
+          level: 'bad',
+          text: `${label}：仰角区间 ${userRange[0]}°–${userRange[1]}° 与该锚点自带仰角带 ${anchorBand[0]}°–${anchorBand[1]}° 无交集，该日不可能同时成立`,
+        });
+        return out;
+      }
+    }
+    out.push({
+      code: 'ELEVATION_MISS',
+      level: 'bad',
+      text: `${label}：窗口内太阳仰角始终不在 ${lo}°–${hi}°（实测 ${fmtDeg(ev.measured.elevationMin)}–${fmtDeg(
+        ev.measured.elevationMax,
+      )}）`,
+    });
+    return out;
+  }
+
+  if (ev.status === 'azimuth_miss') {
+    const [from, to] = iv.azimuthRange!;
+    out.push({
+      code: 'AZIMUTH_MISS',
+      level: 'bad',
+      text: `${label}：太阳方位角始终不在 ${from.toFixed(0)}° 顺时针到 ${to.toFixed(0)}° ±${
+        iv.azimuthTolerance
+      }° 弧内（锚点处实测 ${fmtDeg(ev.measured.anchorPosition?.azimuthDeg)}）`,
+    });
+    return out;
+  }
+
+  // status === 'ok'
+  out.push({
+    code: 'ELEVATION_OK',
+    level: 'ok',
+    text: `${label}：仰角 ${fmtDeg(ev.measured.elevationMin)}–${fmtDeg(ev.measured.elevationMax)}（目标 ${lo}°–${hi}°）`,
+  });
+  if (iv.azimuthRange) {
+    const [from, to] = iv.azimuthRange;
+    out.push({
+      code: 'AZIMUTH_OK',
+      level: 'ok',
+      text: `${label}：方位角命中 ${from.toFixed(0)}°→${to.toFixed(0)}° ±${iv.azimuthTolerance}° 弧`,
+    });
+  }
+  return out;
+}
+
+/** 判定单日窗口（文档 12.4 的算法，逐项产出 reasons）。天文部分全部委托共享层 evaluateDay。 */
 export function computeDay(
   spot: SpotGeom,
-  timing: TimingDto,
+  rawTiming: TimingDto,
   dateKey: string,
   forecast: Awaited<ReturnType<typeof getForecast>>,
 ): DayResult {
-  const reasons: WindowReasonDto[] = [];
+  const timing = normalizeTiming(rawTiming);
   const tz = spot.tz;
-  const events = sunEvents(spot.lat, spot.lng, tz, dateKey);
-  events.notes.forEach((n) => reasons.push({ code: 'SUN_EVENT_NOTE', level: 'info', text: n }));
+  const day: DayEvaluation = evaluateDay(spot.lat, spot.lng, tz, dateKey, timing, sunEvents);
+  const reasons: WindowReasonDto[] = [];
+  day.events.notes.forEach((n) => reasons.push({ code: 'SUN_EVENT_NOTE', level: 'info', text: n }));
 
   // ---- 季节窗口 ----
-  if (timing.seasonWindow) {
-    const { month } = parseLocalDateKey(dateKey);
-    const { fromMonth, toMonth } = timing.seasonWindow;
-    const inSeason =
-      fromMonth <= toMonth ? month >= fromMonth && month <= toMonth : month >= fromMonth || month <= toMonth;
-    if (!inSeason) {
-      reasons.push({
-        code: 'OUT_OF_SEASON',
-        level: 'bad',
-        text: `${month} 月不在设定季节窗口（${fromMonth}–${toMonth} 月）内`,
-      });
-      return {
-        date: dateKey,
-        startAt: events.solarNoon,
-        endAt: events.solarNoon,
-        anchorAt: events.solarNoon,
-        sunElevation: null,
-        sunAzimuth: null,
-        verdict: 'bad',
-        reasons,
-        episode: null,
-      };
-    }
-  }
-
-  // ---- 1) 天文项：解析锚点 ----
-  const resolved = resolveAnchor(events, timing);
-  if (!resolved) {
+  if (day.outOfSeason) {
+    const month = Number(dateKey.slice(5, 7));
+    const { fromMonth, toMonth } = timing.seasonWindow!;
     reasons.push({
-      code: 'ANCHOR_UNRESOLVABLE',
+      code: 'OUT_OF_SEASON',
       level: 'bad',
-      text: `该日无法解析时间锚点（可能是极昼/极夜或偏移越界）`,
+      text: `${month} 月不在设定季节窗口（${fromMonth}–${toMonth} 月）内`,
     });
     return {
       date: dateKey,
-      startAt: events.solarNoon,
-      endAt: events.solarNoon,
-      anchorAt: events.solarNoon,
+      startAt: day.events.solarNoon,
+      endAt: day.events.solarNoon,
+      anchorAt: day.events.solarNoon,
       sunElevation: null,
       sunAzimuth: null,
       verdict: 'bad',
@@ -196,132 +266,88 @@ export function computeDay(
     };
   }
 
-  resolved.notes.forEach((n) => reasons.push({ code: 'ANCHOR_NOTE', level: 'info', text: n }));
-  reasons.push({
-    code: 'ANCHOR_RESOLVED',
-    level: 'ok',
-    text: `${describeAnchor(timing)} → ${formatLocal(resolved.anchorAt, tz)}`,
-  });
+  const multi = day.intervals.length > 1;
 
-  const [bandStart, bandEnd] = bandToRange(resolved, timing);
-  const effectiveElevation = resolved.elevationRange ?? timing.elevationRange;
-  if (resolved.elevationRange) {
+  // ---- 多段：先给出每段的天文结论（预览/可满足率看到的也是这同一份结论）----
+  if (multi) {
+    const okCount = day.intervals.filter((iv) => iv.status === 'ok').length;
     reasons.push({
-      code: 'ELEVATION_TARGET',
-      level: 'info',
-      text: `该锚点自带仰角区间 ${resolved.elevationRange[0]}°–${resolved.elevationRange[1]}°`,
+      code: 'INTERVALS_SUMMARY',
+      level: okCount > 0 ? 'ok' : 'bad',
+      text: `共 ${day.intervals.length} 个允许时段（或关系）：${okCount} 段在该日天文可成立`,
     });
   }
 
-  const spanMin = Math.max(1, (bandEnd.getTime() - bandStart.getTime()) / 60000);
-  const stepMin = Math.max(1, Math.ceil(spanMin / 300)); // 最多 300 个采样点
-  const samples = sampleWindow(spot.lat, spot.lng, bandStart, bandEnd, stepMin);
+  for (const iv of day.intervals) {
+    for (const r of intervalReasons(iv, tz)) reasons.push(r);
+  }
 
-  const elevOk = samples.filter((s) => elevationInRange(s.elevationDeg, effectiveElevation));
-  if (elevOk.length < 2) {
-    const p = solarPosition(resolved.anchorAt, spot.lat, spot.lng);
+  const best = day.best;
+  if (!best) {
+    const anchor =
+      day.intervals.find((iv) => iv.anchorAt)?.anchorAt ??
+      day.intervals[0]?.anchorAt ??
+      day.events.solarNoon;
+    const measured = day.intervals.find((iv) => iv.measured.anchorPosition)?.measured.anchorPosition ?? null;
     reasons.push({
-      code: 'ELEVATION_MISS',
+      code: 'WINDOW_EMPTY',
       level: 'bad',
-      text: `窗口内太阳仰角始终不在 ${effectiveElevation[0]}°–${effectiveElevation[1]}°（锚点处实测 ${fmtDeg(
-        p.elevationDeg,
-      )}）`,
+      text: multi
+        ? '所有允许时段都无法在该日同时满足仰角与方位角约束'
+        : '没有满足全部天文约束的时刻',
     });
     return {
       date: dateKey,
-      startAt: bandStart,
-      endAt: bandEnd,
-      anchorAt: resolved.anchorAt,
-      sunElevation: p.elevationDeg,
-      sunAzimuth: p.azimuthDeg,
-      verdict: 'bad',
-      reasons,
-      episode: null,
-    };
-  }
-  reasons.push({
-    code: 'ELEVATION_OK',
-    level: 'ok',
-    text: `窗口内仰角 ${fmtDeg(Math.min(...elevOk.map((s) => s.elevationDeg)))}–${fmtDeg(
-      Math.max(...elevOk.map((s) => s.elevationDeg)),
-    )}（目标 ${effectiveElevation[0]}°–${effectiveElevation[1]}°）`,
-  });
-
-  // ---- 2) 方位角约束（光位）----
-  let candidateSamples = samples.map((s) => ({ ...s, ok: elevationInRange(s.elevationDeg, effectiveElevation) }));
-  if (timing.azimuthRange) {
-    const [azLo, azHi] = timing.azimuthRange;
-    const center = (azLo + azHi) / 2;
-    const tol = timing.azimuthTolerance;
-    candidateSamples = samples.map((s) => ({
-      ...s,
-      ok:
-        elevationInRange(s.elevationDeg, effectiveElevation) &&
-        angularDistance(s.azimuthDeg, center) <= tol,
-    }));
-    const azOk = candidateSamples.filter((s) => s.ok);
-    if (azOk.length < 2) {
-      const p = solarPosition(resolved.anchorAt, spot.lat, spot.lng);
-      reasons.push({
-        code: 'AZIMUTH_MISS',
-        level: 'bad',
-        text: `太阳方位角始终不在 ${azLo.toFixed(0)}°±${tol}°（锚点处实测 ${fmtDeg(p.azimuthDeg)}）`,
-      });
-      return {
-        date: dateKey,
-        startAt: bandStart,
-        endAt: bandEnd,
-        anchorAt: resolved.anchorAt,
-        sunElevation: p.elevationDeg,
-        sunAzimuth: p.azimuthDeg,
-        verdict: 'bad',
-        reasons,
-        episode: null,
-      };
-    }
-    reasons.push({
-      code: 'AZIMUTH_OK',
-      level: 'ok',
-      text: `方位角命中 ${azLo.toFixed(0)}°±${tol}°（窗口内实测 ${fmtDeg(
-        Math.min(...azOk.map((s) => s.azimuthDeg)),
-      )}–${fmtDeg(Math.max(...azOk.map((s) => s.azimuthDeg)))}）`,
-    });
-  }
-
-  const run = longestRun(candidateSamples);
-  if (!run) {
-    reasons.push({ code: 'WINDOW_EMPTY', level: 'bad', text: '没有满足全部天文约束的时刻' });
-    return {
-      date: dateKey,
-      startAt: bandStart,
-      endAt: bandEnd,
-      anchorAt: resolved.anchorAt,
-      sunElevation: null,
-      sunAzimuth: null,
+      startAt: best?.band?.start ?? anchor,
+      endAt: best?.band?.end ?? anchor,
+      anchorAt: anchor,
+      sunElevation: measured?.elevationDeg ?? null,
+      sunAzimuth: measured?.azimuthDeg ?? null,
       verdict: 'bad',
       reasons,
       episode: null,
     };
   }
 
+  const run = best.run!;
+  // 采样步长用于补足「窗口时长」（最后一个采样点代表一个步长）
+  const span = best.band
+    ? Math.max(1, (best.band.end.getTime() - best.band.start.getTime()) / 60000)
+    : 1;
+  const stepMin = Math.max(1, Math.ceil(span / 300));
   const durationMin = (run.end.getTime() - run.start.getTime()) / 60000 + stepMin;
+
   let verdict: WindowVerdict = 'good';
   if (durationMin < 5) {
     verdict = 'marginal';
     reasons.push({
       code: 'WINDOW_TOO_SHORT',
       level: 'warn',
-      text: `可用窗口仅约 ${durationMin.toFixed(0)} 分钟（少于 5 分钟）`,
+      text: `${intervalLabel(best)}：可用窗口仅约 ${durationMin.toFixed(0)} 分钟（少于 5 分钟）`,
     });
   }
   reasons.push({
     code: 'WINDOW_RANGE',
     level: 'ok',
-    text: `窗口 ${formatLocal(run.start, tz)}–${formatLocal(run.end, tz)}（约 ${durationMin.toFixed(0)} 分钟）`,
+    text: `${multi ? `${intervalLabel(best)} 给出最长窗口：` : ''}${formatLocal(run.start, tz, true)}–${formatLocal(
+      run.end,
+      tz,
+      true,
+    )}（约 ${durationMin.toFixed(0)} 分钟）`,
   });
 
   const mid = new Date((run.start.getTime() + run.end.getTime()) / 2);
-  const midPos = solarPosition(mid, spot.lat, spot.lng);
+  const midSample =
+    best.samples
+      .filter((s) => s.ok)
+      .reduce<(typeof best.samples)[number] | null>(
+        (acc, s) =>
+          acc === null ||
+          Math.abs(s.at.getTime() - mid.getTime()) < Math.abs(acc.at.getTime() - mid.getTime())
+            ? s
+            : acc,
+        null,
+      ) ?? best.samples[0] ?? null;
 
   // ---- 3) 天气项 ----
   const episode = summarizeEpisode(forecast, run.start, run.end);
@@ -335,7 +361,7 @@ export function computeDay(
   } else {
     const profile = timing.weatherProfile;
     const hard = new Set(profile.hardRequirements ?? ['precipProbPctMax']);
-    const isNight = midPos.elevationDeg < -12;
+    const isNight = (midSample?.elevationDeg ?? best.measured.anchorPosition?.elevationDeg ?? 0) < -12;
 
     const check = (
       code: string,
@@ -442,29 +468,16 @@ export function computeDay(
     date: dateKey,
     startAt: run.start,
     endAt: run.end,
-    anchorAt: resolved.anchorAt,
-    sunElevation: midPos.elevationDeg,
-    sunAzimuth: midPos.azimuthDeg,
+    anchorAt: best.anchorAt ?? run.start,
+    sunElevation: midSample?.elevationDeg ?? null,
+    sunAzimuth: midSample?.azimuthDeg ?? null,
     verdict,
     reasons,
     episode,
   };
 }
 
-function describeAnchor(timing: TimingDto): string {
-  switch (timing.timeAnchor) {
-    case 'sunrise_plus':
-      return `日出后 ${timing.anchorOffsetMin} 分`;
-    case 'sunset_minus':
-      return `日落前 ${Math.abs(timing.anchorOffsetMin)} 分`;
-    case 'fixed_clock':
-      return `固定钟点 ${String(Math.floor(timing.anchorOffsetMin / 60)).padStart(2, '0')}:${String(
-        Math.round(timing.anchorOffsetMin % 60),
-      ).padStart(2, '0')}`;
-    default:
-      return timing.timeAnchor;
-  }
-}
+/** evaluateDay 需要的太阳事件函数由 @flil/shared 直接导入（sunEvents）。 */
 
 export interface ComputeOptions {
   days?: number;

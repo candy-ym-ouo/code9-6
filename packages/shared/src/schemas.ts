@@ -10,6 +10,7 @@ import {
   TimeAnchor,
   WeatherPhenomenon,
 } from './enums.js';
+import { validateAzimuthArc } from './geometry.js';
 
 const zEnum = <T extends Record<string, string>>(e: T) =>
   z.enum(Object.values(e) as [string, ...string[]]);
@@ -29,20 +30,89 @@ export const weatherProfileSchema = z.object({
   hardRequirements: z.array(z.string()).optional(),
 });
 
-export const timingSchema = z.object({
-  timeAnchor: zEnum(TimeAnchor),
-  anchorOffsetMin: z.number().int().min(-1440).max(1440).default(0),
-  elevationRange: z.array(z.number()).length(2).default([-90, 90]),
-  azimuthRange: z.array(z.number()).length(2).nullable().default(null),
-  azimuthTolerance: z.number().min(0).max(180).default(15),
-  windowToleranceMin: z.number().int().min(1).max(180).default(12),
-  weatherProfile: weatherProfileSchema.default({}),
-  seasonWindow: z
-    .object({ fromMonth: z.number().int().min(1).max(12), toMonth: z.number().int().min(1).max(12) })
-    .nullable()
-    .default(null),
-  notes: z.string().max(2000).nullable().default(null),
-});
+/**
+ * 单个允许时段。方位角允许弧 [from,to] 按「from 顺时针到 to」解释，
+ * 可跨过 0°/360°；跨弧超过 180° 视为无效并给出可复算的拒绝理由。
+ */
+export const timingIntervalSchema = z
+  .object({
+    timeAnchor: zEnum(TimeAnchor),
+    anchorOffsetMin: z.number().int().min(-1440).max(1440).default(0),
+    elevationRange: z
+      .array(z.number().min(-90).max(90))
+      .length(2)
+      .default([-90, 90])
+      .refine((r) => r[1] - r[0] >= -0.05, {
+        message: '仰角区间上界必须不小于下界',
+      }),
+    azimuthRange: z
+      .array(z.number().min(0).max(360))
+      .length(2)
+      .nullable()
+      .default(null)
+      .superRefine((range, ctx) => {
+        if (!range) return;
+        const check = validateAzimuthArc(range[0], range[1]);
+        if (!check.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, message: check.error });
+      }),
+    azimuthTolerance: z.number().min(0).max(180).default(15),
+    windowToleranceMin: z.number().int().min(1).max(180).default(12),
+    label: z.string().max(120).nullable().optional(),
+  })
+  .superRefine((iv, ctx) => {
+    // 容差叠加在允许弧外侧后总跨弧仍不得超过 360°（超过即任何方位都"命中"，约束失去意义）
+    if (iv.azimuthRange) {
+      const check = validateAzimuthArc(iv.azimuthRange[0], iv.azimuthRange[1]);
+      if (check.ok && check.width + iv.azimuthTolerance * 2 > 360 + 1e-9) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['azimuthTolerance'],
+          message: `方位角容差过大：允许弧 ${check.width.toFixed(0)}° 加上 ±${iv.azimuthTolerance}° 后覆盖整个圆周，约束无效`,
+        });
+      }
+    }
+  });
+
+export const timingSchema = z
+  .object({
+    timeAnchor: zEnum(TimeAnchor),
+    anchorOffsetMin: z.number().int().min(-1440).max(1440).default(0),
+    elevationRange: z.array(z.number().min(-90).max(90)).length(2).default([-90, 90]),
+    azimuthRange: z.array(z.number().min(0).max(360)).length(2).nullable().default(null),
+    azimuthTolerance: z.number().min(0).max(180).default(15),
+    windowToleranceMin: z.number().int().min(1).max(180).default(12),
+    intervals: z.array(timingIntervalSchema).min(1).max(6).optional(),
+    weatherProfile: weatherProfileSchema.default({}),
+    seasonWindow: z
+      .object({ fromMonth: z.number().int().min(1).max(12), toMonth: z.number().int().min(1).max(12) })
+      .nullable()
+      .default(null),
+    notes: z.string().max(2000).nullable().default(null),
+  })
+  .superRefine((timing, ctx) => {
+    // 顶层旧字段的方位角同样要校验（intervals 缺省时它就是唯一段）
+    if (timing.azimuthRange) {
+      const check = validateAzimuthArc(timing.azimuthRange[0], timing.azimuthRange[1]);
+      if (!check.ok) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['azimuthRange'], message: check.error });
+        return;
+      }
+      if (check.width + timing.azimuthTolerance * 2 > 360 + 1e-9) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['azimuthTolerance'],
+          message: `方位角容差过大：允许弧 ${check.width.toFixed(0)}° 加上 ±${timing.azimuthTolerance}° 后覆盖整个圆周，约束无效`,
+        });
+      }
+    }
+    if (timing.elevationRange[1] < timing.elevationRange[0] - 0.05) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['elevationRange'],
+        message: '仰角区间上界必须不小于下界',
+      });
+    }
+  });
 
 export const createInspirationSchema = z.object({
   title: z.string().min(1).max(200),

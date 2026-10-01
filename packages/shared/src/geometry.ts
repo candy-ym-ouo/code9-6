@@ -114,6 +114,43 @@ export function expectedAzimuth(cameraBearing: number, lightBearing: number): nu
   return (((cameraBearing + lightBearing) % 360) + 360) % 360;
 }
 
+/**
+ * 沿顺时针方向 a → b 的有向夹角（0..360）。
+ * 方位角区间用顺时针弧表达，因此可以自然跨过 0°/360°（如 350° → 10° = 20°）。
+ */
+export function clockwiseArc(a: number, b: number): number {
+  return (((b - a) % 360) + 360) % 360;
+}
+
+/** 方位角 value 是否落在以 from 为起点、顺时针跨 width 度的允许弧内（含端点）。 */
+export function azimuthWithinArc(value: number, from: number, width: number): boolean {
+  return clockwiseArc(from, value) <= width + 1e-9;
+}
+
+/**
+ * 校验方位角允许弧 [from, to]（from→to 为顺时针方向）。
+ * 用顺时针弧表达区间，0°/360° 接缝不再产生歧义。
+ * @returns 合法时返回 { ok, width }；非法时返回可直接展示的中文理由。
+ */
+export function validateAzimuthArc(from: number, to: number):
+  | { ok: true; width: number }
+  | { ok: false; error: string } {
+  if (!Number.isFinite(from) || !Number.isFinite(to)) {
+    return { ok: false, error: '方位角必须是数字' };
+  }
+  if (from < 0 || from > 360 || to < 0 || to > 360) {
+    return { ok: false, error: '方位角需在 0°–360° 之间' };
+  }
+  const width = clockwiseArc(from, to);
+  if (width > 180 + 1e-9) {
+    return {
+      ok: false,
+      error: `方位角允许区间 ${from.toFixed(0)}° 顺时针到 ${to.toFixed(0)}° 跨 ${width.toFixed(0)}°，超过 180° 上限（请调换两个端点或收窄区间）`,
+    };
+  }
+  return { ok: true, width };
+}
+
 export function angleDiff(a: number, b: number): number {
   const d = Math.abs((((a - b) % 360) + 360) % 360);
   return d > 180 ? 360 - d : d;

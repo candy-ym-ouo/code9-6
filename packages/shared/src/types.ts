@@ -28,6 +28,22 @@ export interface WeatherProfile {
   hardRequirements?: string[];
 }
 
+/**
+ * 一段允许时段（多段之间为「或」：任一段成立即可拍）。
+ * 每段独立指定时间锚、偏移、仰角区间与方位角允许弧；
+ * 方位角区间 [azimuthFrom, azimuthTo] 以「from 顺时针到 to」解释，可跨过 0°/360°。
+ */
+export interface TimingInterval {
+  timeAnchor: TimeAnchor;
+  anchorOffsetMin: number;
+  elevationRange: number[];
+  azimuthRange: number[] | null;
+  azimuthTolerance: number;
+  windowToleranceMin: number;
+  /** 前端标注用，不参与判定；可选的人类可读备注 */
+  label?: string | null;
+}
+
 export interface TimingDto {
   timeAnchor: TimeAnchor;
   anchorOffsetMin: number;
@@ -35,6 +51,8 @@ export interface TimingDto {
   azimuthRange: number[] | null;
   azimuthTolerance: number;
   windowToleranceMin: number;
+  /** 多段允许时段；缺省时由上面的顶层（旧字段）合成单段，保持向后兼容 */
+  intervals?: TimingInterval[];
   weatherProfile: WeatherProfile;
   seasonWindow: { fromMonth: number; toMonth: number } | null;
   notes: string | null;

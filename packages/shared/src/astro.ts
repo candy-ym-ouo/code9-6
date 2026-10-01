@@ -160,13 +160,18 @@ function pickCrossing(
 
 /**
  * 计算某地某「本地日期」的全部太阳事件。
- * 扫描范围向两侧各外扩 3 小时，避免凌晨/深夜事件被日界切断。
+ * 常规事件的扫描范围向两侧各外扩 3 小时，避免凌晨/深夜事件被日界切断；
+ * 夜间事件（太阳仰角 -12°）在高纬度冬季可能跨越整个午夜并延续到次晨很迟，
+ * 因此单独用 ±20 小时的宽窗扫描，保证跨午夜、极夜前夜/后夜的 nightEnd 不丢失。
  */
 export function sunEvents(lat: number, lng: number, tz: string, localDate: string): SunEvents {
   const { year, month, day } = parseLocalDateKey(localDate);
   const dayRange = localDayRangeUtc(localDate, tz);
   const scanFrom = addMinutes(dayRange.start, -180);
   const scanTo = addMinutes(dayRange.end, 180);
+  // 极夜前后的晨昏蒙影可能从当日下午一直延续到次日中午前后，宽窗才能覆盖。
+  const nightScanFrom = addMinutes(dayRange.start, -20 * 60);
+  const nightScanTo = addMinutes(dayRange.end, 20 * 60);
   const notes: string[] = [];
 
   const noonRef = zonedTimeToUtc(tz, year, month, day, 12, 0);
@@ -177,7 +182,7 @@ export function sunEvents(lat: number, lng: number, tz: string, localDate: strin
   const cGoldenUp = findElevationCrossings(lat, lng, scanFrom, scanTo, GOLDEN_UPPER_DEG);
   const cGoldenLow = findElevationCrossings(lat, lng, scanFrom, scanTo, GOLDEN_LOWER_DEG);
   const cBlueLow = findElevationCrossings(lat, lng, scanFrom, scanTo, BLUE_LOWER_DEG);
-  const cNight = findElevationCrossings(lat, lng, scanFrom, scanTo, NIGHT_DEG);
+  const cNight = findElevationCrossings(lat, lng, nightScanFrom, nightScanTo, NIGHT_DEG);
 
   const sunriseC = pickCrossing(cHorizon, { rising: true });
   const sunsetC = [...cHorizon].reverse().find((c) => !c.rising) ?? null;
@@ -187,6 +192,27 @@ export function sunEvents(lat: number, lng: number, tz: string, localDate: strin
 
   if (polar === 'midnight_sun') notes.push('该日太阳未落（极昼），无日出/日落锚点');
   if (polar === 'polar_night') notes.push('该日太阳未升（极夜），无日出/日落锚点');
+
+  // 极昼/极夜下「日出/日落衍生带」没有物理定义：窄窗扫描可能在接缝处误取到
+  // 前一日或次日的穿越点（看起来像跨午夜的黄金时刻，实则错误），一律置空。
+  if (polar !== 'none') {
+    return {
+      date: localDate,
+      tz,
+      solarNoon,
+      maxElevationDeg,
+      sunrise: null,
+      sunset: null,
+      goldenAm: null,
+      goldenPm: null,
+      blueAm: null,
+      bluePm: null,
+      nightStart: polar === 'polar_night' ? dayRange.start : null,
+      nightEnd: polar === 'polar_night' ? dayRange.end : null,
+      polar,
+      notes,
+    };
+  }
 
   const goldenAmStart = sunriseC
     ? findElevationCrossings(lat, lng, addMinutes(sunriseC.time, -120), addMinutes(sunriseC.time, 240), GOLDEN_LOWER_DEG).find((c) => c.rising)
@@ -209,11 +235,15 @@ export function sunEvents(lat: number, lng: number, tz: string, localDate: strin
     ? [...findElevationCrossings(lat, lng, addMinutes(sunsetC.time, -180), addMinutes(sunsetC.time, 180), BLUE_LOWER_DEG)].reverse().find((c) => !c.rising)
     : null;
 
+  // 夜间开始：日落附近第一次由上向下穿过 -12°（高纬冬季在日落后很快入夜）。
+  // 夜间结束：夜间开始之后第一次回升穿过 -12°（高纬冬季会落到次日早晨，跨午夜）。
   const nightStart = sunsetC
-    ? [...cNight].reverse().find((c) => !c.rising && c.time.getTime() >= sunsetC.time.getTime() - 3600000) ?? null
+    ? cNight.find(
+        (c) => !c.rising && c.time.getTime() >= sunsetC.time.getTime() - 3 * 3600000,
+      ) ?? null
     : null;
-  const nightEnd = sunriseC
-    ? cNight.find((c) => c.rising && c.time.getTime() >= sunriseC.time.getTime() - 3600000) ?? null
+  const nightEnd = nightStart
+    ? cNight.find((c) => c.rising && c.time.getTime() >= nightStart.time.getTime()) ?? null
     : null;
 
   const band = (a: Crossing | null | undefined, b: Crossing | null | undefined) =>
@@ -335,10 +365,22 @@ export function resolveAnchor(
       return { anchorAt: events.solarNoon, elevationRange: null, band: null, notes };
     }
     case 'night': {
-      if (!events.nightStart) {
+      if (events.polar === 'midnight_sun' || !events.nightStart) {
         notes.push('该日无夜间时段（极昼）');
         return null;
       }
+      // 极夜整日太阳都低于 -12°：用本地整天作为夜间带（可跨到本地午夜之后）。
+      if (events.polar === 'polar_night') {
+        notes.push('该日为极夜，夜间时段覆盖全天');
+        const { start, end } = localDayRangeUtc(events.date, events.tz);
+        return {
+          anchorAt: start,
+          elevationRange: [-90, NIGHT_DEG],
+          band: { start, end },
+          notes,
+        };
+      }
+      // 高纬冬季 nightEnd 可能落在次日中午前后（跨午夜）；缺失时按起算后 240 分钟兜底。
       const end = events.nightEnd ?? addMinutes(events.nightStart, 240);
       const capped = end.getTime() - events.nightStart.getTime() > 240 * 60000;
       if (capped) notes.push('夜间窗口过长，已截取前 240 分钟');
@@ -388,72 +430,6 @@ export function sampleWindow(
     out.push({ at: last, elevationDeg: p.elevationDeg, azimuthDeg: p.azimuthDeg });
   }
   return out;
-}
-
-/** 一年中"该条件理论可成立"的天数（只看天文与季节，不含天气），见 12.5。 */
-export function theoreticalDaysInYear(
-  lat: number,
-  lng: number,
-  tz: string,
-  timing: Pick<
-    TimingDto,
-    | 'timeAnchor'
-    | 'anchorOffsetMin'
-    | 'elevationRange'
-    | 'azimuthRange'
-    | 'azimuthTolerance'
-    | 'seasonWindow'
-    | 'windowToleranceMin'
-  >,
-  year: number,
-): { date: string; ok: boolean }[] {
-  const out: { date: string; ok: boolean }[] = [];
-  const start = new Date(Date.UTC(year, 0, 1));
-  for (let i = 0; i < 366; i += 1) {
-    const d = new Date(start.getTime() + i * 86400000);
-    if (d.getUTCFullYear() !== year) break;
-    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(
-      d.getUTCDate(),
-    ).padStart(2, '0')}`;
-    out.push({ date: key, ok: theoreticalOkForDay(lat, lng, tz, key, timing) });
-  }
-  return out;
-}
-
-export function theoreticalOkForDay(
-  lat: number,
-  lng: number,
-  tz: string,
-  date: string,
-  timing: Pick<
-    TimingDto,
-    | 'timeAnchor'
-    | 'anchorOffsetMin'
-    | 'elevationRange'
-    | 'azimuthRange'
-    | 'azimuthTolerance'
-    | 'seasonWindow'
-    | 'windowToleranceMin'
-  >,
-): boolean {
-  if (timing.seasonWindow) {
-    const { month } = parseLocalDateKey(date);
-    const { fromMonth, toMonth } = timing.seasonWindow;
-    const inSeason =
-      fromMonth <= toMonth ? month >= fromMonth && month <= toMonth : month >= fromMonth || month <= toMonth;
-    if (!inSeason) return false;
-  }
-  const events = sunEvents(lat, lng, tz, date);
-  const resolved = resolveAnchor(events, timing);
-  if (!resolved) return false;
-  const [start, end] = bandToRange(resolved, timing);
-  const samples = sampleWindow(lat, lng, start, end, 5);
-  const usable = samples.filter((s) => elevationInRange(s.elevationDeg, timing.elevationRange));
-  if (usable.length < 2) return false;
-  if (!timing.azimuthRange) return true;
-  const [azLo, azHi] = timing.azimuthRange;
-  const center = (azLo + azHi) / 2;
-  return usable.some((s) => angularDistance(s.azimuthDeg, center) <= timing.azimuthTolerance + 0.001);
 }
 
 export function elevationInRange(elevationDeg: number, range: number[]): boolean {

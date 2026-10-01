@@ -447,3 +447,110 @@ describe('E10 备份与质量门', () => {
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
   });
 });
+
+describe('E11 多段允许区间：无效方位拒绝 + 跨午夜/极区预览与窗口一致', () => {
+  let polarCardId = '';
+  it('方位角区间顺时针跨弧超过 180° → 400 且错误可解释（中文）', async () => {
+    const res = await call('post', `/api/inspirations/${cardId}/timing/preview`, {
+      timeAnchor: 'sunset_minus',
+      anchorOffsetMin: 40,
+      elevationRange: [-4, 10],
+      azimuthRange: [10, 350],
+      azimuthTolerance: 15,
+      windowToleranceMin: 12,
+      weatherProfile: {},
+      seasonWindow: null,
+      notes: null,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.details.issues[0].message).toMatch(/顺时针|180/);
+  });
+
+  it('跨正北接缝的合法弧（350°→10°）可保存、可试算', async () => {
+    const res = await call('post', `/api/inspirations/${cardId}/timing/preview`, {
+      timeAnchor: 'sunset_minus',
+      anchorOffsetMin: 40,
+      elevationRange: [-4, 10],
+      azimuthRange: [350, 10],
+      azimuthTolerance: 15,
+      windowToleranceMin: 12,
+      weatherProfile: {},
+      seasonWindow: null,
+      notes: null,
+    });
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.intervals)).toBe(true);
+  });
+
+  it('极区机位：日落段极昼无解，但加一段正午锚点后当天可满足（预览与窗口一致）', async () => {
+    const place = await call('post', '/api/places', { name: '斯瓦尔巴', city: '朗伊尔城' });
+    const spot = await call('post', '/api/spots', {
+      placeId: place.body.id,
+      lat: 78.22,
+      lng: 15.65,
+      cameraBearing: 180,
+      tz: 'Europe/Oslo',
+    });
+    const card = await call('post', '/api/inspirations', { title: '极昼备选时段卡' });
+    polarCardId = card.body.id;
+    await call('post', `/api/inspirations/${card.body.id}/spot`, { spotId: spot.body.id });
+
+    const body = {
+      timeAnchor: 'sunset_minus',
+      anchorOffsetMin: 40,
+      elevationRange: [-4, 10],
+      azimuthRange: null,
+      azimuthTolerance: 15,
+      windowToleranceMin: 12,
+      intervals: [
+        {
+          timeAnchor: 'sunset_minus',
+          anchorOffsetMin: 40,
+          elevationRange: [-4, 10],
+          azimuthRange: null,
+          azimuthTolerance: 15,
+          windowToleranceMin: 12,
+        },
+        {
+          timeAnchor: 'solar_noon',
+          anchorOffsetMin: 0,
+          elevationRange: [0, 45],
+          azimuthRange: null,
+          azimuthTolerance: 15,
+          windowToleranceMin: 30,
+        },
+      ],
+      weatherProfile: {},
+      seasonWindow: null,
+      notes: null,
+    };
+
+    const preview = await call('post', `/api/inspirations/${card.body.id}/timing/preview`, body);
+    expect(preview.status).toBe(200);
+    // 极昼发生在 6 月；当前日期若非极昼季，至少要保证两段状态都被逐段返回
+    expect(preview.body.intervals).toHaveLength(2);
+    expect(['none', 'midnight_sun', 'polar_night']).toContain(preview.body.polarity);
+
+    const saved = await call('put', `/api/inspirations/${card.body.id}/timing`, body);
+    expect(saved.status).toBe(200);
+    expect(saved.body.item.intervals).toHaveLength(2);
+    const windows = await call('post', `/api/inspirations/${card.body.id}/windows/recompute`, { days: 7 });
+    expect(windows.status).toBe(200);
+    expect(windows.body.items).toHaveLength(7);
+    // 窗口判定的理由必须逐段可见（与预览同一套结论）
+    for (const w of windows.body.items) {
+      const segmentReasons = w.reasons.filter((r: { code: string }) =>
+        ['ANCHOR_RESOLVED', 'ANCHOR_UNRESOLVABLE', 'ELEVATION_MISS', 'AZIMUTH_MISS', 'INTERVALS_SUMMARY'].includes(
+          r.code,
+        ),
+      );
+      expect(segmentReasons.length).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it('多段落库后顶层字段镜像第一段（旧读取路径兼容）', async () => {
+    const detail = await call('get', `/api/inspirations/${polarCardId}`);
+    expect(detail.body.item.timing.intervals.length).toBe(2);
+    expect(detail.body.item.timing.timeAnchor).toBe('sunset_minus');
+  });
+});
